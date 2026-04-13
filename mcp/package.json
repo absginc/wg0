@@ -1,0 +1,33 @@
+{
+  "name": "@wg0/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for wg0 — operate a WireGuard control plane from Claude Desktop or any MCP-aware agent.",
+  "license": "Proprietary",
+  "author": "wg0",
+  "homepage": "https://wg0.io",
+  "bin": {
+    "wg0-mcp": "dist/index.js"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,1293 @@
+openapi: 3.1.0
+info:
+  title: wg0 brain API
+  version: "1.0.0"
+  summary: Control plane for wg0 — multi-tenant WireGuard private networking
+  description: |
+    wg0 is a multi-tenant WireGuard control plane. The brain exposes a
+    REST API for:
+
+    * multi-tenant account + network management (JWT-authenticated)
+    * node enrollment, heartbeat, and unenroll (token + per-device secret)
+    * native-LAN mode, overlay networks, and BYO Exit upstream tunnels
+    * four-state presence (Online / Observed / Offline / Unknown)
+    * device protocol v2 — strict, versioned, capability-aware
+    * a separate admin surface gated on `X-Admin-Key`
+
+    See the companion documents for context:
+
+    * [README](https://github.com/absginc/ABSLINK-brain/blob/main/README.md)
+    * [DEVICE_PROTOCOL.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/DEVICE_PROTOCOL.md)
+    * [BYO_EXIT.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/BYO_EXIT.md)
+    * [TESTING_ROADMAP.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/TESTING_ROADMAP.md)
+    * [ROADBLOCKS.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/ROADBLOCKS.md)
+
+    ## Versioning
+
+    * Everything under `/api/v1/...` is frozen. Additive changes only.
+    * `/api/v2/devices/:id/state` is the strict, versioned device protocol
+      surface. Callers must send `Wg0-Protocol-Version: 2`.
+    * v2 can evolve additively within v2; a structural change that breaks
+      v2 clients means v3.
+
+    ## Authentication schemes
+
+    | Scheme | Header / field | Used by |
+    |---|---|---|
+    | `bearerAuth` | `Authorization: Bearer <JWT>` | owner-authenticated endpoints (dashboard + automation) |
+    | `deviceSecret` | `X-Device-Secret: <secret>` | per-device endpoints (heartbeat, unenroll, config, rotate-secret, v2 state) |
+    | `strictDeviceAuth` | `X-Device-Secret` + `Wg0-Protocol-Version: 2` | v2 endpoints — no grace fallback |
+    | `adminKey` | `X-Admin-Key: <key>` | `/api/v1/admin/*` endpoints |
+    | `enrollmentToken` | `token` field in request body | `/api/v1/enroll/register` only |
+
+  contact:
+    name: wg0
+    url: https://wg0.io
+  license:
+    name: Proprietary
+servers:
+  - url: https://connect.wg0.io
+    description: Production brain
+  - url: http://localhost:8000
+    description: Local dev brain
+
+tags:
+  - name: Auth
+    description: Account registration and login
+  - name: API Keys
+    description: Personal access tokens for long-lived automation
+  - name: Networks
+    description: Multi-tenant network management
+  - name: Enrollment
+    description: Enrollment tokens + node registration
+  - name: Nodes
+    description: Node lifecycle + heartbeat
+  - name: Device Protocol v1
+    description: Device-authenticated endpoints on the v1 surface
+  - name: Device Protocol v2
+    description: Strict, versioned, capability-aware device surface
+  - name: BYO Exit
+    description: Upstream WireGuard tunnels attached to host nodes
+  - name: Traffic
+    description: Traffic telemetry
+  - name: Admin
+    description: Platform-wide admin endpoints (X-Admin-Key)
+  - name: Health
+    description: Service health
+
+security: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Health check
+      description: Simple liveness probe. No auth required.
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: wg0-brain }
+
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: registerAccount
+      summary: Create a new account
+      description: |
+        Creates a new multi-tenant account. Returns a JWT on success.
+        The password is hashed server-side with Argon2id; the brain never
+        persists plaintext.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountRegister"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "409":
+          description: Email already in use
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: loginAccount
+      summary: Exchange credentials for a JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountLogin"
+      responses:
+        "200":
+          description: Login succeeded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/api-keys:
+    get:
+      tags: [API Keys]
+      operationId: listApiKeys
+      summary: List personal access tokens for the authenticated account
+      description: |
+        **JWT-only** — the `jwtAuth` security scheme enforces this.
+        PAT bearers are explicitly rejected with 401 so a leaked PAT
+        cannot enumerate sibling credentials.
+
+        Returns every PAT owned by this account, revoked ones
+        included. Plaintext and hash are never returned — only the
+        8-char prefix, metadata, and usage timestamps. Sort order:
+        live keys first (most recent first), then revoked keys.
+      security:
+        - jwtAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApiKeyListEntry" }
+        "401":
+          description: Missing JWT or PAT used
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [API Keys]
+      operationId: createApiKey
+      summary: Mint a new personal access token
+      description: |
+        **JWT-only** — enforced by the `jwtAuth` security scheme. PAT
+        bearers are rejected with 401. A leaked PAT must never be
+        able to mint successor credentials; minting requires fresh
+        proof that the caller is the human owner.
+
+        Returns the plaintext API key ONCE in the response body. The
+        brain only stores the Argon2id hash. Optional `expires_at`
+        auto-retires the token at the given time — strongly
+        recommended for scheduled automation.
+
+        PATs in the current MVP have the same authority as the
+        user's JWT for every non-PAT-management endpoint (scope
+        enforcement is tracked as follow-up in
+        `docs/ROADBLOCKS.md` §9). Within PAT management itself,
+        however, PATs are powerless — the only thing that can mint,
+        list, or revoke them is a JWT.
+      security:
+        - jwtAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateApiKeyRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreateApiKeyResponse" }
+        "401":
+          description: Missing JWT or PAT used
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/api-keys/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [API Keys]
+      operationId: revokeApiKey
+      summary: Revoke a personal access token
+      description: |
+        **JWT-only** — a leaked PAT cannot revoke its siblings, which
+        would turn credential leakage into an availability attack.
+
+        Sets `revoked_at`. Idempotent — revoking a non-existent or
+        already-revoked key returns 204 either way, preventing
+        oracle-style enumeration.
+      security:
+        - jwtAuth: []
+      responses:
+        "204": { description: Revoked }
+        "401":
+          description: Missing JWT or PAT used
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/networks:
+    get:
+      tags: [Networks]
+      operationId: listNetworks
+      summary: List all networks owned by the authenticated account
+      description: |
+        Returns every network the account owns, each enriched with
+        aggregate counts: `node_count`, `online_count`, `tx_bytes`,
+        `rx_bytes`. `online_count` follows the four-state presence
+        model (Online + Observed both counted as connected).
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/NetworkWithStats" }
+        "401":
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      tags: [Networks]
+      operationId: createNetwork
+      summary: Create a new network
+      description: |
+        Creates either an overlay network (default, private subnet like
+        `10.64.x.x`) or a native-LAN network (clients appear as real
+        members of the host's LAN). See `network_type`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NetworkCreate" }
+      responses:
+        "201":
+          description: Network created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Network" }
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/networks/{id}:
+    parameters:
+      - $ref: "#/components/parameters/NetworkId"
+    delete:
+      tags: [Networks]
+      operationId: deleteNetwork
+      summary: Delete a network and all its nodes
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Deleted }
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/networks/{id}/provision:
+    parameters:
+      - $ref: "#/components/parameters/NetworkId"
+    post:
+      tags: [Enrollment]
+      operationId: provisionDevice
+      summary: Server-side keygen + enrollment for the QR/mobile flow
+      description: |
+        The brain generates a WireGuard keypair server-side, enrolls a
+        new node with the generated public key, and returns the full
+        `wg0.conf` text with the `PrivateKey` line populated.
+
+        The private key is transmitted ONCE in the response and never
+        persisted. The dashboard renders the wg_config as a QR code so
+        stock WireGuard mobile apps can scan it directly.
+
+        Devices enrolled via this path get `device_kind = 'provisioned'`
+        and a `device_secret` (for future agent upgrades). The device
+        secret is NOT returned in the response since stock WireGuard
+        has nowhere to store it.
+
+        For the bring-your-own-key path, see `/api/v1/enroll/register`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProvisionRequest" }
+      responses:
+        "201":
+          description: Device provisioned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProvisionResponse" }
+
+  /api/v1/enroll/generate-token:
+    post:
+      tags: [Enrollment]
+      operationId: generateEnrollmentToken
+      summary: Mint an enrollment token for a network
+      description: |
+        Tokens are used by the shell connector's `enroll` subcommand and
+        by any other agent that supplies its own WireGuard public key.
+        Single-use by default; pass `is_reusable: true` for a long-lived
+        MSP provisioning token.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TokenRequest" }
+      responses:
+        "201":
+          description: Token minted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnrollmentToken" }
+
+  /api/v1/enroll/register:
+    post:
+      tags: [Enrollment]
+      operationId: enrollNode
+      summary: Register a node using an enrollment token
+      description: |
+        Bring-your-own-key enrollment. The caller supplies its own
+        WireGuard `public_key`; the brain never sees the private key.
+        Returns overlay IP, peer list, full wg_config template with
+        the `PrivateKey` placeholder, and a `device_secret` for
+        subsequent device-authenticated calls.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnrollRequest" }
+      responses:
+        "201":
+          description: Enrolled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnrollResponse" }
+        "400":
+          description: Invalid token or payload
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/nodes:
+    get:
+      tags: [Nodes]
+      operationId: listNodes
+      summary: List nodes owned by the authenticated account
+      description: |
+        Returns every node across every network the account owns, each
+        enriched with derived fields: `presence` (four-state),
+        `observed_endpoint` (from discover), `last_activity` (max of
+        heartbeat + observations), `on_host_lan` (physical LAN adjacency
+        for native-LAN clients).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: network_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: Optional filter to a single network
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/NodeWithStatus" }
+
+  /api/v1/nodes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    patch:
+      tags: [Nodes]
+      operationId: updateNode
+      summary: Update node settings
+      description: |
+        Updates mutable node fields. `route_all_traffic` is only valid on
+        client nodes in native-LAN networks and will be rejected otherwise.
+        `current_upstream_exit_id` / `clear_upstream_exit` are only valid
+        on host nodes in native-LAN networks. Any field that affects the
+        rendered wg_config bumps `config_version` so managed connectors
+        fetch fresh config on their next heartbeat.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NodeUpdate" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Node" }
+        "422":
+          description: Validation error (guardrail hit)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      tags: [Nodes]
+      operationId: deleteNode
+      summary: Delete a node (owner-authenticated)
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Deleted }
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/nodes/{id}/heartbeat:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    post:
+      tags: [Device Protocol v1]
+      operationId: postHeartbeat
+      summary: Managed connector heartbeat
+      description: |
+        Called by the managed connector every 30 seconds. Reports
+        telemetry, peer observations, and route-all state. Response
+        carries the fresh peer map, optional upstream_exit block,
+        and `config_version` for drift detection.
+
+        Authentication: if the node has a `device_secret_hash`,
+        `X-Device-Secret` is required. Pre-v2 rows (NULL hash) use
+        the grace path — header is accepted but not required.
+      security:
+        - deviceSecret: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HeartbeatRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HeartbeatResponse" }
+        "401":
+          description: Invalid X-Device-Secret
+        "404":
+          description: Node not found
+
+  /api/v1/nodes/{id}/self:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    delete:
+      tags: [Device Protocol v1]
+      operationId: selfUnenroll
+      summary: Connector self-unenroll
+      description: |
+        Called by the connector's `unenroll` subcommand. Removes the
+        node row and unregisters the peer from discover.
+      security:
+        - deviceSecret: []
+      responses:
+        "204": { description: Unenrolled }
+        "401":
+          description: Invalid X-Device-Secret
+        "404":
+          description: Node not found
+
+  /api/v1/nodes/{id}/config:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    get:
+      tags: [Device Protocol v1]
+      operationId: getDeviceConfig
+      summary: Fetch the current rendered wg_config for this device
+      description: |
+        Returns a freshly-rendered `wg_config` text with the `PrivateKey`
+        placeholder preserved. The connector calls this when the heartbeat
+        response advertises a `config_version` greater than the local
+        stored value — it then substitutes its private key, rewrites
+        `/etc/wireguard/wg0.conf`, and runs `wg syncconf` to converge
+        the live interface without teardown.
+      security:
+        - deviceSecret: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceConfigResponse" }
+
+  /api/v1/nodes/{id}/rotate-secret:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    post:
+      tags: [Device Protocol v1]
+      operationId: rotateDeviceSecret
+      summary: Rotate the per-device secret
+      description: |
+        Generates a fresh secret, updates the stored Argon2id hash, and
+        returns the new plaintext ONCE. Requires the CURRENT secret via
+        `X-Device-Secret` — this is how post-incident rotation and
+        legacy-to-strict migration both happen.
+      security:
+        - deviceSecret: []
+      responses:
+        "200":
+          description: Rotated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RotateSecretResponse" }
+
+  /api/v2/devices/{id}/state:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    post:
+      tags: [Device Protocol v2]
+      operationId: postDeviceState
+      summary: Report current state + receive desired state (v2)
+      description: |
+        The v2 replacement for `/api/v1/nodes/:id/heartbeat`. Strict
+        `X-Device-Secret` + `Wg0-Protocol-Version: 2` required. Body
+        includes explicit `capabilities: [...]` the brain uses to
+        capability-gate the desired-state response.
+      security:
+        - strictDeviceAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/V2StateReport" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/V2StateResponse" }
+        "401":
+          description: Missing or invalid X-Device-Secret
+        "422":
+          description: Missing or wrong Wg0-Protocol-Version
+    get:
+      tags: [Device Protocol v2]
+      operationId: getDeviceState
+      summary: Fetch desired state only (v2)
+      description: |
+        Drift-refresh pull without reporting telemetry. Same auth rules
+        as POST.
+      security:
+        - strictDeviceAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ProtocolVersion"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/V2StateResponse" }
+
+  /api/v1/nodes/{id}/upstream-exits:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    get:
+      tags: [BYO Exit]
+      operationId: listUpstreamExits
+      summary: List upstream WireGuard tunnels for a host
+      description: |
+        The `wg_config` field is intentionally excluded from list
+        responses — it contains a private key and only the host itself
+        (via its heartbeat) should ever see it.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/UpstreamExitSummary" }
+    post:
+      tags: [BYO Exit]
+      operationId: createUpstreamExit
+      summary: Upload an upstream WireGuard config
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateUpstreamExitRequest" }
+      responses:
+        "201":
+          description: Upstream created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UpstreamExitSummary" }
+
+  /api/v1/upstream-exits/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [BYO Exit]
+      operationId: deleteUpstreamExit
+      summary: Delete an upstream exit
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Deleted }
+
+  /api/v1/nodes/{id}/traffic:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    get:
+      tags: [Traffic]
+      operationId: getNodeTraffic
+      summary: Time-series traffic for a single node
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: hours
+          in: query
+          schema: { type: integer, default: 24, minimum: 1, maximum: 168 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeTraffic" }
+
+  /api/v1/networks/{id}/traffic:
+    parameters:
+      - $ref: "#/components/parameters/NetworkId"
+    get:
+      tags: [Traffic]
+      operationId: getNetworkTraffic
+      summary: Aggregated time-series traffic for a network
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: hours
+          in: query
+          schema: { type: integer, default: 24 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeTraffic" }
+
+  /api/v1/admin/stats:
+    get:
+      tags: [Admin]
+      operationId: adminStats
+      summary: Platform-wide summary counters
+      security:
+        - adminKey: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdminStats" }
+
+  /api/v1/admin/accounts:
+    get:
+      tags: [Admin]
+      operationId: adminListAccounts
+      summary: All accounts with network + node counts
+      security:
+        - adminKey: []
+      responses:
+        "200":
+          description: OK
+
+  /api/v1/admin/nodes:
+    get:
+      tags: [Admin]
+      operationId: adminListNodes
+      summary: All enrolled nodes across all accounts
+      description: |
+        Returns per-node presence, `observed_endpoint`, `last_activity`,
+        `device_kind`, `route_all_traffic`, `route_all_active`,
+        `on_host_lan` — the full admin-dashboard row.
+      security:
+        - adminKey: []
+      responses:
+        "200":
+          description: OK
+
+  /api/v1/admin/networks:
+    get:
+      tags: [Admin]
+      operationId: adminListNetworks
+      summary: All networks with per-network counts
+      security:
+        - adminKey: []
+      responses:
+        "200":
+          description: OK
+
+  /api/v1/admin/traffic:
+    get:
+      tags: [Admin]
+      operationId: adminTraffic
+      summary: Per-account / per-network traffic totals
+      security:
+        - adminKey: []
+      responses:
+        "200":
+          description: OK
+
+components:
+  parameters:
+    NetworkId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Network UUID
+    NodeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      description: Node UUID
+    ProtocolVersion:
+      name: Wg0-Protocol-Version
+      in: header
+      required: true
+      schema: { type: string, enum: ["2"] }
+      description: Must be exactly "2" for v2 endpoints
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT or wg0_pat
+      description: |
+        Either an owner JWT from `/api/v1/auth/login` or a personal
+        access token (`wg0_pat_<43 chars>`) from
+        `POST /api/v1/api-keys`. Both go in the
+        `Authorization: Bearer <token>` header. The brain routes
+        `wg0_pat_*` prefixed values to the PAT lookup path and
+        everything else to JWT decoding. PATs have the same authority
+        as the user's JWT for the MVP — scope enforcement is tracked
+        as follow-up in ROADBLOCKS.md §9.
+
+        **Exception:** PAT management endpoints under `/api/v1/api-keys`
+        use the separate `jwtAuth` scheme which rejects PATs. This
+        prevents a leaked PAT from minting successor credentials or
+        revoking sibling credentials.
+    jwtAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Strict JWT-only variant. Used by endpoints where PATs are
+        explicitly rejected: `POST /api/v1/api-keys`,
+        `GET /api/v1/api-keys`, `DELETE /api/v1/api-keys/:id`. Obtain
+        via `/api/v1/auth/login`. A PAT-prefixed bearer on these
+        endpoints returns 401 with a clear error message.
+    deviceSecret:
+      type: apiKey
+      in: header
+      name: X-Device-Secret
+      description: |
+        Per-device secret returned once at enrollment. Used for all
+        device-authenticated endpoints on the v1 surface. Pre-v2 rows
+        (NULL `device_secret_hash`) use a grace path that accepts
+        the request without the header.
+    strictDeviceAuth:
+      type: apiKey
+      in: header
+      name: X-Device-Secret
+      description: |
+        Strict variant used by v2 endpoints. Requires a matching
+        stored hash — no grace fallback. v2 endpoints also require
+        `Wg0-Protocol-Version: 2` as a separate header; see the
+        `ProtocolVersion` parameter.
+    adminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Shared-secret key for the `/api/v1/admin/*` surface. Set via
+        `ADMIN_API_KEY` env var on the brain; restrict admin access
+        at the firewall / reverse-proxy level as well.
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        detail:
+          type: string
+          example: Invalid credentials
+      required: [detail]
+
+    AccountRegister:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+        company_name: { type: string, nullable: true }
+
+    AccountLogin:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+
+    TokenResponse:
+      type: object
+      required: [access_token, token_type]
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, example: bearer }
+
+    CreateApiKeyRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Human-readable label (e.g. "ci-bot", "monitoring-cron")
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Optional auto-retirement time. None = never expires.
+
+    CreateApiKeyResponse:
+      type: object
+      required: [id, name, key_prefix, created_at, api_key]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        key_prefix:
+          type: string
+          description: First 8 chars of the random section, for display/audit
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true }
+        api_key:
+          type: string
+          description: |
+            Plaintext token, format `wg0_pat_<43 urlsafe-b64 chars>`.
+            Returned ONCE and never again — the brain stores only the
+            Argon2id hash. Capture this at mint time; if you lose it,
+            you must revoke and mint a new one.
+          example: wg0_pat_kx7aBCd9fGhIjKlMnOpQrStUvWxYz0123456789-_Abc
+
+    ApiKeyListEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        key_prefix: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+          description: For MVP always `["full"]`. Scope enforcement is future work.
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+
+    NetworkCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        network_type:
+          type: string
+          enum: [overlay, native]
+          default: overlay
+        overlay_subnet:
+          type: string
+          description: Overlay mode only. None → auto-assign from pool.
+          nullable: true
+        native_gateway_subnet: { type: string, nullable: true, example: "192.168.1.0/24" }
+        native_host_tunnel_ip: { type: string, nullable: true, example: "192.168.1.2" }
+        native_client_start: { type: string, nullable: true, example: "192.168.1.200" }
+        native_client_end: { type: string, nullable: true, example: "192.168.1.220" }
+
+    Network:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        name: { type: string }
+        overlay_subnet: { type: string }
+        network_index: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        network_type: { type: string, enum: [overlay, native] }
+        native_gateway_subnet: { type: string, nullable: true }
+        native_host_tunnel_ip: { type: string, nullable: true }
+        native_client_start: { type: string, nullable: true }
+        native_client_end: { type: string, nullable: true }
+
+    NetworkWithStats:
+      allOf:
+        - $ref: "#/components/schemas/Network"
+        - type: object
+          properties:
+            node_count: { type: integer, format: int64 }
+            online_count: { type: integer, format: int64 }
+            tx_bytes: { type: integer, format: int64 }
+            rx_bytes: { type: integer, format: int64 }
+
+    Node:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        network_id: { type: string, format: uuid }
+        node_name: { type: string }
+        os_type: { type: string, nullable: true }
+        role: { type: string, enum: [client, host] }
+        overlay_ip: { type: string }
+        public_key: { type: string }
+        advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+        last_seen: { type: string, format: date-time, nullable: true }
+        is_online: { type: boolean }
+        last_endpoint: { type: string, nullable: true }
+        tx_bytes: { type: integer, format: int64 }
+        rx_bytes: { type: integer, format: int64 }
+        route_all_traffic: { type: boolean }
+        route_all_active: { type: boolean }
+
+    Presence:
+      type: string
+      enum: [online, observed, offline, unknown]
+      description: |
+        Four-state presence model:
+
+        * `online` — managed device with fresh heartbeat OR confirmed
+          by a managed peer's host observation report
+        * `observed` — no authoritative signal, but the discover sidecar
+          saw a fresh WireGuard handshake within 15 minutes
+        * `offline` — managed device that used to heartbeat but hasn't
+          been seen by any source recently
+        * `unknown` — provisioned device with no telemetry yet
+
+    NodeWithStatus:
+      allOf:
+        - $ref: "#/components/schemas/Node"
+        - type: object
+          properties:
+            on_host_lan: { type: boolean }
+            presence: { $ref: "#/components/schemas/Presence" }
+            observed_endpoint: { type: string, nullable: true }
+            last_activity: { type: string, format: date-time, nullable: true }
+
+    NodeUpdate:
+      type: object
+      properties:
+        node_name: { type: string }
+        route_all_traffic: { type: boolean }
+        current_upstream_exit_id: { type: string, format: uuid, nullable: true }
+        clear_upstream_exit: { type: boolean }
+
+    PeerConfig:
+      type: object
+      properties:
+        public_key: { type: string }
+        allowed_ips: { type: string, example: "10.0.0.2/32, 10.0.0.0/24" }
+        endpoint: { type: string, nullable: true }
+        is_online: { type: boolean }
+        on_same_lan: { type: boolean }
+
+    HeartbeatRequest:
+      type: object
+      properties:
+        endpoint: { type: string, nullable: true }
+        tx_bytes: { type: integer, format: int64, nullable: true }
+        rx_bytes: { type: integer, format: int64, nullable: true }
+        peers:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/ObservedPeer" }
+        route_all_active: { type: boolean, nullable: true }
+
+    ObservedPeer:
+      type: object
+      description: One peer from `wg show <iface> dump` as the connector sees it
+      properties:
+        public_key: { type: string }
+        last_handshake: { type: integer, format: int64, nullable: true, description: Unix seconds; null = never }
+        rx_bytes: { type: integer, format: int64 }
+        tx_bytes: { type: integer, format: int64 }
+
+    HeartbeatResponse:
+      type: object
+      properties:
+        overlay_ip: { type: string }
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/PeerConfig" }
+        upstream_exit:
+          nullable: true
+          $ref: "#/components/schemas/HostUpstreamExit"
+        config_version: { type: integer, format: int64 }
+
+    HostUpstreamExit:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        provider_type: { type: string }
+        wg_config: { type: string }
+
+    DeviceConfigResponse:
+      type: object
+      properties:
+        wg_config: { type: string, description: "Full wg_config text with PrivateKey placeholder preserved" }
+        config_version: { type: integer, format: int64 }
+        device_kind: { type: string, enum: [managed, provisioned] }
+
+    RotateSecretResponse:
+      type: object
+      properties:
+        device_secret: { type: string, description: "New plaintext, returned once" }
+
+    ProvisionRequest:
+      type: object
+      required: [node_name]
+      properties:
+        node_name: { type: string }
+        os_type: { type: string, nullable: true }
+        role:
+          type: string
+          enum: [client, host]
+          default: client
+        advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+
+    ProvisionResponse:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        overlay_ip: { type: string }
+        network_type: { type: string, enum: [overlay, native] }
+        public_key: { type: string }
+        wg_config: { type: string, description: "Full wg0.conf text with PrivateKey populated" }
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/PeerConfig" }
+
+    TokenRequest:
+      type: object
+      required: [network_id]
+      properties:
+        network_id: { type: string, format: uuid }
+        is_reusable: { type: boolean, default: false }
+        expires_at: { type: string, format: date-time, nullable: true }
+
+    EnrollmentToken:
+      type: object
+      properties:
+        token_value: { type: string }
+        network_id: { type: string, format: uuid }
+        is_reusable: { type: boolean }
+        expires_at: { type: string, format: date-time, nullable: true }
+
+    EnrollRequest:
+      type: object
+      required: [token, node_name, public_key]
+      properties:
+        token: { type: string }
+        node_name: { type: string }
+        public_key: { type: string, description: "WireGuard public key, base64" }
+        os_type: { type: string, nullable: true }
+        role:
+          type: string
+          enum: [client, host]
+          default: client
+        advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+        endpoint: { type: string, nullable: true }
+
+    EnrollResponse:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        overlay_ip: { type: string }
+        network_type: { type: string, enum: [overlay, native] }
+        device_secret:
+          type: string
+          description: Per-device secret. Returned ONCE; the brain only stores the Argon2id hash.
+        wg_config: { type: string }
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/PeerConfig" }
+
+    UpstreamExitSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        host_node_id: { type: string, format: uuid }
+        name: { type: string }
+        provider_type: { type: string }
+        created_at: { type: string, format: date-time }
+        is_active: { type: boolean }
+
+    CreateUpstreamExitRequest:
+      type: object
+      required: [name, wg_config]
+      properties:
+        name: { type: string }
+        provider_type: { type: string, default: "custom-wg" }
+        wg_config: { type: string, description: "Full wg0.conf text" }
+
+    TrafficBucket:
+      type: object
+      properties:
+        ts: { type: string, format: date-time }
+        tx_bytes: { type: integer, format: int64 }
+        rx_bytes: { type: integer, format: int64 }
+
+    NodeTraffic:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        total_tx_bytes: { type: integer, format: int64 }
+        total_rx_bytes: { type: integer, format: int64 }
+        buckets:
+          type: array
+          items: { $ref: "#/components/schemas/TrafficBucket" }
+
+    # ── Device protocol v2 ──────────────────────────────────────────────
+    V2StateReport:
+      type: object
+      required: [capabilities]
+      properties:
+        capabilities:
+          type: array
+          items: { type: string }
+          description: |
+            Stable capability identifiers this device can act on. The
+            brain will not emit desired-state fields whose convergence
+            requires a capability absent from this list.
+          example:
+            - split_tunnel_macos
+            - byo_exit_macos
+            - peer_observations
+            - desired_state_convergence
+        current_state: { $ref: "#/components/schemas/V2CurrentState" }
+
+    V2CurrentState:
+      type: object
+      properties:
+        endpoint_observed_local: { type: string, nullable: true }
+        tx_bytes_lifetime: { type: integer, format: int64, nullable: true }
+        rx_bytes_lifetime: { type: integer, format: int64, nullable: true }
+        route_all_active: { type: boolean, nullable: true }
+        peers:
+          type: array
+          nullable: true
+          items: { $ref: "#/components/schemas/ObservedPeer" }
+        last_convergence_errors:
+          type: array
+          nullable: true
+          items: { type: string }
+
+    V2StateResponse:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        overlay_ip: { type: string }
+        network_type: { type: string, enum: [overlay, native] }
+        device_kind: { type: string, enum: [managed, provisioned] }
+        config_version: { type: integer, format: int64 }
+        desired_state: { $ref: "#/components/schemas/V2DesiredState" }
+        server_time: { type: string, format: date-time }
+        required_capabilities:
+          type: array
+          items: { type: string }
+          description: |
+            Capabilities that would have been needed to act on fields
+            that got capability-gated out of this response. Clients
+            that see a non-empty list know they should surface an
+            upgrade hint.
+
+    V2DesiredState:
+      type: object
+      properties:
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/PeerConfig" }
+        upstream_exit: { $ref: "#/components/schemas/V2UpstreamExit" }
+        route_all_traffic: { type: boolean }
+
+    V2UpstreamExit:
+      oneOf:
+        - type: object
+          required: [state]
+          properties:
+            state: { type: string, enum: [off] }
+        - type: object
+          required: [state, id, name, provider_type, wg_config]
+          properties:
+            state: { type: string, enum: [active] }
+            id: { type: string, format: uuid }
+            name: { type: string }
+            provider_type: { type: string }
+            wg_config: { type: string }
+
+    AdminStats:
+      type: object
+      properties:
+        total_accounts: { type: integer, format: int64 }
+        total_networks: { type: integer, format: int64 }
+        total_nodes: { type: integer, format: int64 }
+        online_nodes: { type: integer, format: int64 }
+        observed_nodes: { type: integer, format: int64 }
+        offline_nodes: { type: integer, format: int64 }
+        unknown_nodes: { type: integer, format: int64 }
+        host_nodes: { type: integer, format: int64 }
+        client_nodes: { type: integer, format: int64 }
+        total_tokens: { type: integer, format: int64 }
+        total_tx_bytes: { type: integer, format: int64 }
+        total_rx_bytes: { type: integer, format: int64 }
