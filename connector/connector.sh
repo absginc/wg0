@@ -329,12 +329,22 @@ elif [[ "\$PREV_UPSTREAM_ID" != "off" ]]; then
     echo "off" > "\$UPSTREAM_STATE_FILE"
 fi
 
-# ── Apply peer map updates ──────────────────────────────────────────────────
+# ── Apply peer map updates + stale route cleanup ──────────────────────────
 # wg set updates WireGuard's crypto-key routing table. System routes are
 # added for each allowed_ips CIDR so packets actually reach the tunnel.
 # 0.0.0.0/0 is handled above via the split-tunnel state machine — skip it
 # in the per-peer loop so we don't clobber the /1 pair with a /0 replace.
 # Peers flagged on_same_lan also skip route installation — LAN handles it.
+#
+# Stale route cleanup: track installed routes in a state file. On each
+# heartbeat, diff old vs new and remove routes no longer in the peer list.
+# This handles profile route policy changes (split→off, CIDR removal).
+
+INSTALLED_ROUTES_FILE="${KEY_DIR}/installed_routes"
+PREV_ROUTES=""
+[[ -f "\$INSTALLED_ROUTES_FILE" ]] && PREV_ROUTES=\$(cat "\$INSTALLED_ROUTES_FILE")
+NEW_ROUTES=""
+
 echo "\$RESPONSE" | jq -c '.peers[]' 2>/dev/null | while read -r peer; do
     PUBKEY=\$(echo "\$peer" | jq -r '.public_key')
     ALLOWED=\$(echo "\$peer" | jq -r '.allowed_ips')
@@ -349,8 +359,33 @@ echo "\$RESPONSE" | jq -c '.peers[]' 2>/dev/null | while read -r peer; do
     echo "\$ALLOWED" | tr ',' '\\n' | tr -d ' ' | while read -r cidr; do
         [[ -z "\$cidr" || "\$cidr" == "0.0.0.0/0" ]] && continue
         ip route replace "\$cidr" dev ${WG_IFACE} 2>/dev/null || true
+        echo "\$cidr" >> "\${INSTALLED_ROUTES_FILE}.new"
     done
 done
+
+# Remove stale routes: CIDRs in the old set but not in the new set.
+if [[ -f "\${INSTALLED_ROUTES_FILE}.new" ]]; then
+    sort -u "\${INSTALLED_ROUTES_FILE}.new" > "\${INSTALLED_ROUTES_FILE}.sorted" 2>/dev/null || true
+    if [[ -n "\$PREV_ROUTES" ]]; then
+        echo "\$PREV_ROUTES" | while read -r old_cidr; do
+            [[ -z "\$old_cidr" ]] && continue
+            if ! grep -qxF "\$old_cidr" "\${INSTALLED_ROUTES_FILE}.sorted" 2>/dev/null; then
+                ip route del "\$old_cidr" dev ${WG_IFACE} 2>/dev/null || true
+            fi
+        done
+    fi
+    mv -f "\${INSTALLED_ROUTES_FILE}.sorted" "\$INSTALLED_ROUTES_FILE" 2>/dev/null || true
+    rm -f "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
+else
+    # No routes installed this cycle — remove all previously tracked.
+    if [[ -n "\$PREV_ROUTES" ]]; then
+        echo "\$PREV_ROUTES" | while read -r old_cidr; do
+            [[ -z "\$old_cidr" ]] && continue
+            ip route del "\$old_cidr" dev ${WG_IFACE} 2>/dev/null || true
+        done
+    fi
+    rm -f "\$INSTALLED_ROUTES_FILE" 2>/dev/null || true
+fi
 HBSCRIPT
     chmod +x "$HEARTBEAT_SCRIPT"
 }
