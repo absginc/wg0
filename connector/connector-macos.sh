@@ -430,6 +430,20 @@ else
     fi
     rm -f "\$INSTALLED_ROUTES_FILE" "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
 fi
+
+# ── Remove stale WireGuard peers ──────────────────────────────────────────
+# If the brain stopped advertising a peer (e.g., native-LAN host-routed
+# mode), remove it from WireGuard's crypto-key routing table.
+RESPONSE_PUBKEYS=\$(echo "\$RESPONSE" | jq -r '.peers[].public_key' 2>/dev/null | sort -u)
+WG_PUBKEYS=\$(wg show "\$WG_REAL" peers 2>/dev/null | sort -u)
+if [[ -n "\$WG_PUBKEYS" ]]; then
+    echo "\$WG_PUBKEYS" | while read -r wg_pk; do
+        [[ -z "\$wg_pk" ]] && continue
+        if ! echo "\$RESPONSE_PUBKEYS" | grep -qxF "\$wg_pk"; then
+            wg set "\$WG_REAL" peer "\$wg_pk" remove 2>/dev/null || true
+        fi
+    done
+fi
 HBSCRIPT
     chmod +x "$HEARTBEAT_SCRIPT"
 }
