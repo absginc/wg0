@@ -211,4 +211,16 @@ while true; do
             ip route replace "$cidr" dev ${WG_IFACE} 2>/dev/null || true
         done
     done
+
+    # ── Remove stale WireGuard peers ──
+    RESPONSE_PUBKEYS=$(echo "$RESPONSE" | jq -r '.peers[].public_key' 2>/dev/null | sort -u)
+    WG_PUBKEYS=$(wg show ${WG_IFACE} peers 2>/dev/null | sort -u)
+    if [[ -n "$WG_PUBKEYS" ]]; then
+        echo "$WG_PUBKEYS" | while read -r wg_pk; do
+            [[ -z "$wg_pk" ]] && continue
+            if ! echo "$RESPONSE_PUBKEYS" | grep -qxF "$wg_pk"; then
+                wg set ${WG_IFACE} peer "$wg_pk" remove 2>/dev/null || true
+            fi
+        done
+    fi
 done
