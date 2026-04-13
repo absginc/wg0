@@ -86,8 +86,6 @@ private struct DashboardView: View {
                         Text("wg0").font(.system(size: 28, weight: .bold))
                         if let me = model.accountInfo {
                             Text(me.user_email).font(.caption).foregroundStyle(.secondary)
-                            Text("\(me.plan_display_name) · \(me.user_role)")
-                                .font(.caption2).foregroundStyle(.tertiary)
                         }
                     }
                     Spacer()

@@ -199,6 +199,16 @@ actor LiveConnectorCoordinator: ConnectorCoordinatorProtocol {
 
     /// Run a shell command with admin privileges via osascript.
     /// macOS shows its standard password dialog once.
+    /// Run a command with admin privileges, returning (output, success).
+    private func privilegedSafe(_ command: String) async -> (String, Bool) {
+        do {
+            let output = try await privileged(command)
+            return (output, true)
+        } catch {
+            return (error.localizedDescription, false)
+        }
+    }
+
     @discardableResult
     private func privileged(_ command: String) async throws -> String {
         let escaped = command
@@ -286,10 +296,47 @@ actor LiveConnectorCoordinator: ConnectorCoordinatorProtocol {
 
     /// Write a WireGuard config to /etc/wireguard/wg0.conf (privileged).
     func writeConfig(_ config: String) async throws {
-        // Write via a temp file to avoid shell escaping issues.
         let tmp = NSTemporaryDirectory() + "wg0-conf-\(UUID().uuidString).conf"
         try config.write(toFile: tmp, atomically: true, encoding: .utf8)
         try await privileged("mkdir -p \(Self.configDir) && mv \(tmp) \(Self.configPath) && chmod 600 \(Self.configPath)")
+    }
+
+    /// Write config AND apply it live via wg syncconf (no tunnel restart).
+    /// The config must already have the real PrivateKey substituted.
+    func writeAndSyncConfig(_ config: String) async throws {
+        let tmp = NSTemporaryDirectory() + "wg0-conf-\(UUID().uuidString).conf"
+        try config.write(toFile: tmp, atomically: true, encoding: .utf8)
+        // Atomic write + syncconf in one privileged call.
+        let cmd = [
+            "mv \(tmp) \(Self.configPath)",
+            "chmod 600 \(Self.configPath)",
+            "\(Self.wg) syncconf \(Self.interfaceName) <(\(Self.wgQuick) strip \(Self.configPath)) 2>/dev/null || true",
+        ].joined(separator: " && ")
+        try await privileged(cmd)
+    }
+
+    /// Read tunnel stats via privileged `wg show`. Returns nil if
+    /// the user cancels the admin prompt or the tunnel is down.
+    func readTunnelStats() async -> (endpoint: String?, txBytes: Int64, rxBytes: Int64, routeAllActive: Bool)? {
+        guard let iface = detectRunningInterface() else { return nil }
+        let cmd = "\(Self.wg) show \(iface) dump"
+        let (output, ok) = await privilegedSafe(cmd)
+        guard ok else { return nil }
+        let lines = output.split(separator: "\n")
+        var totalTx: Int64 = 0
+        var totalRx: Int64 = 0
+        var endpoint: String? = nil
+        var routeAll = false
+        for line in lines.dropFirst() {
+            let f = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard f.count >= 8 else { continue }
+            let ep = String(f[3])
+            if ep != "(none)" && endpoint == nil { endpoint = ep }
+            totalRx += Int64(String(f[5])) ?? 0
+            totalTx += Int64(String(f[6])) ?? 0
+            if String(f[7]).contains("0.0.0.0/0") { routeAll = true }
+        }
+        return (endpoint, totalTx, totalRx, routeAll)
     }
 
     // ── Shell helpers ──────────────────────────────────────────────

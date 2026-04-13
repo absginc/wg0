@@ -1,11 +1,16 @@
 import Foundation
 
-/// Simple file-based credential storage in ~/Library/Application Support/io.wg0.macos/.
+/// File-based credential storage in ~/Library/Application Support/io.wg0.macos/.
 ///
-/// We avoid the macOS Keychain because unsigned/dev-signed apps get a
-/// Keychain password prompt every time the binary changes (every rebuild).
+/// DEV-STAGE COMPROMISE: We use plaintext files instead of the macOS
+/// Keychain because unsigned/dev-signed apps trigger a Keychain password
+/// prompt on every binary change (every rebuild). Once the app is signed
+/// with an Apple Developer ID, this should migrate to Keychain with a
+/// stable code-signing identity so the ACL persists across updates.
+///
 /// The device_secret is already stored in plaintext by the shell connector
-/// at /etc/wireguard/wg0/device_secret, so Keychain adds no real security.
+/// at /etc/wireguard/wg0/device_secret, so file storage is no worse than
+/// the shell connector's security model during this phase.
 
 enum KeychainHelper {
     private static let appDir: String = {

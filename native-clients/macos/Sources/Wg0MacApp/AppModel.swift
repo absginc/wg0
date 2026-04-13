@@ -349,11 +349,28 @@ final class AppModel: ObservableObject {
               let secret = KeychainHelper.load(.deviceSecret),
               let token = accessToken else { return }
 
-        // No wg show here — no password prompts. Just send the
-        // heartbeat. The brain knows we're alive; tx/rx stats come
-        // from the shell connector's heartbeat if it's still running.
+        // In app-managed mode, read real tunnel stats. This calls
+        // privileged wg show — macOS caches the admin auth for a few
+        // minutes so it won't prompt on every tick after the first.
+        // In shell-managed mode, send zeros — the shell connector's
+        // own heartbeat reports the real stats.
+        var endpoint: String? = nil
+        var txBytes: Int64 = 0
+        var rxBytes: Int64 = 0
+        var routeAllActive = false
+
+        if tunnelMode == .appManaged,
+           let liveCoord = connectorCoordinator as? LiveConnectorCoordinator,
+           let stats = await liveCoord.readTunnelStats() {
+            endpoint = stats.endpoint
+            txBytes = stats.txBytes
+            rxBytes = stats.rxBytes
+            routeAllActive = stats.routeAllActive
+        }
+
         let body = HeartbeatRequest(
-            endpoint: nil, tx_bytes: 0, rx_bytes: 0, route_all_active: false
+            endpoint: endpoint, tx_bytes: txBytes, rx_bytes: rxBytes,
+            route_all_active: routeAllActive
         )
 
         do {
@@ -366,7 +383,7 @@ final class AppModel: ObservableObject {
 
             // Re-check tunnel is still up (file check, no root).
             if let liveCoord = connectorCoordinator as? LiveConnectorCoordinator {
-                let iface = await liveCoord.detectRunningInterface()
+                let iface = liveCoord.detectRunningInterface()
                 if iface != nil {
                     connectionState = .connected
                 } else {
@@ -393,14 +410,36 @@ final class AppModel: ObservableObject {
               let secret = KeychainHelper.load(.deviceSecret),
               let token = accessToken else { return }
         do {
-            let config = try await brainSession.getNodeConfig(
+            let rawConfig = try await brainSession.getNodeConfig(
                 token: token, nodeId: nodeId, deviceSecret: secret
             )
-            KeychainHelper.save(.wgConfig, value: config)
-            if let liveCoord = connectorCoordinator as? LiveConnectorCoordinator {
-                try await liveCoord.writeConfig(config)
+
+            // The brain returns wg_config with a placeholder PrivateKey.
+            // Reinsert the locally stored key before writing to disk.
+            let privateKey = KeychainHelper.load(.publicKey).flatMap { _ in
+                // The actual private key is stored on disk by the
+                // enrollment flow or the shell connector.
+                try? String(contentsOfFile: "/etc/wireguard/wg0/private.key", encoding: .utf8)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
             }
-            statusMessage = "Config refreshed from brain."
+
+            let config: String
+            if let pk = privateKey {
+                config = rawConfig.replacingOccurrences(
+                    of: "# PrivateKey = <CONNECTOR_FILLS_THIS_IN>",
+                    with: "PrivateKey = \(pk)"
+                )
+            } else {
+                config = rawConfig
+            }
+
+            KeychainHelper.save(.wgConfig, value: config)
+
+            // Write to disk AND apply live via wg syncconf (no restart).
+            if let liveCoord = connectorCoordinator as? LiveConnectorCoordinator {
+                try await liveCoord.writeAndSyncConfig(config)
+            }
+            statusMessage = "Config refreshed and applied."
         } catch {
             statusMessage = "Config refresh failed: \(error.localizedDescription)"
         }
