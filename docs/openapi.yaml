@@ -8,19 +8,21 @@ info:
     REST API for:
 
     * multi-tenant account + network management (JWT-authenticated)
+    * device-first managed connector inventory and per-membership control
     * node enrollment, heartbeat, and unenroll (token + per-device secret)
     * native-LAN mode, overlay networks, and BYO Exit upstream tunnels
+    * relay assist on native and overlay networks via network `relay_mode`
     * four-state presence (Online / Observed / Offline / Unknown)
     * device protocol v2 — strict, versioned, capability-aware
     * a separate admin surface gated on `X-Admin-Key`
 
     See the companion documents for context:
 
-    * [README](https://github.com/absginc/ABSLINK-brain/blob/main/README.md)
-    * [DEVICE_PROTOCOL.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/DEVICE_PROTOCOL.md)
-    * [BYO_EXIT.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/BYO_EXIT.md)
-    * [TESTING_ROADMAP.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/TESTING_ROADMAP.md)
-    * [ROADBLOCKS.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/ROADBLOCKS.md)
+    * [README](https://github.com/absginc/wg0/blob/main/README.md)
+    * [DEVICE_PROTOCOL.md](https://github.com/absginc/wg0/blob/main/docs/DEVICE_PROTOCOL.md)
+    * [BYO_EXIT.md](https://github.com/absginc/wg0/blob/main/docs/BYO_EXIT.md)
+    * [TESTING_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/TESTING_ROADMAP.md)
+    * [ROADBLOCKS.md](https://github.com/absginc/wg0/blob/main/docs/ROADBLOCKS.md)
 
     ## Versioning
 
@@ -35,7 +37,7 @@ info:
     | Scheme | Header / field | Used by |
     |---|---|---|
     | `bearerAuth` | `Authorization: Bearer <JWT>` | owner-authenticated endpoints (dashboard + automation) |
-    | `deviceSecret` | `X-Device-Secret: <secret>` | per-device endpoints (heartbeat, unenroll, config, rotate-secret, v2 state) |
+    | `deviceSecret` | `X-Device-Secret: <secret>` | per-device endpoints on the v1 surface (heartbeat, config, rotate-secret, claim, self-delete) |
     | `strictDeviceAuth` | `X-Device-Secret` + `Wg0-Protocol-Version: 2` | v2 endpoints — no grace fallback |
     | `adminKey` | `X-Admin-Key: <key>` | `/api/v1/admin/*` endpoints |
     | `enrollmentToken` | `token` field in request body | `/api/v1/enroll/register` only |
@@ -56,6 +58,12 @@ tags:
     description: Account registration and login
   - name: API Keys
     description: Personal access tokens for long-lived automation
+  - name: Accounts
+    description: Account context, memberships, and team management
+  - name: Devices
+    description: Managed device inventory, peerings, endpoint history, and memberships
+  - name: Device Profiles
+    description: Access profiles and self-service device controls
   - name: Networks
     description: Multi-tenant network management
   - name: Enrollment
@@ -144,6 +152,287 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/accounts/me:
+    get:
+      tags: [Accounts]
+      operationId: getAccountMe
+      summary: Current account context, plan, usage, and billing state
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AccountMeResponse" }
+
+  /api/v1/accounts/me/memberships:
+    get:
+      tags: [Accounts]
+      operationId: listAccountMemberships
+      summary: List every account membership for the current user
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/MembershipSummary" }
+
+  /api/v1/accounts/switch:
+    post:
+      tags: [Accounts]
+      operationId: switchAccount
+      summary: Switch active account context
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SwitchAccountRequest" }
+      responses:
+        "200":
+          description: Fresh bearer token for the requested account context
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+
+  /api/v1/auth/accept-invite:
+    post:
+      tags: [Auth]
+      operationId: acceptInvite
+      summary: Accept a pending account invitation
+      description: |
+        Public endpoint. The invitation token in the request body is the
+        authentication mechanism for this route.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                token: { type: string }
+                name: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Invitation accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenResponse" }
+        "400":
+          description: Invalid or expired invitation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/accounts/users:
+    get:
+      tags: [Accounts]
+      operationId: listAccountUsers
+      summary: List users and pending invitations on the current account
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+
+  /api/v1/accounts/users/invite:
+    post:
+      tags: [Accounts]
+      operationId: inviteAccountUser
+      summary: Invite a user to the current account
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string, format: email }
+                role: { type: string }
+      responses:
+        "200":
+          description: Invitation created
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/accounts/users/invite/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Accounts]
+      operationId: revokeAccountInvite
+      summary: Revoke a pending account invitation
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Revoked }
+
+  /api/v1/accounts/users/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Accounts]
+      operationId: updateAccountUser
+      summary: Change a member role on the current account
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: { type: string }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+    delete:
+      tags: [Accounts]
+      operationId: removeAccountUser
+      summary: Remove a user from the current account
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Removed }
+
+  /api/v1/accounts/users/{id}/suspend:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Accounts]
+      operationId: suspendAccountUser
+      summary: Suspend a user on the current account
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Suspended
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/accounts/users/{id}/reactivate:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Accounts]
+      operationId: reactivateAccountUser
+      summary: Reactivate a suspended user on the current account
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Reactivated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/accounts/users/{id}/scopes:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Accounts]
+      operationId: listAccountUserScopes
+      summary: List network scopes for a team manager
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+    post:
+      tags: [Accounts]
+      operationId: addAccountUserScope
+      summary: Grant a team manager access to a network
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                network_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Scope added
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/accounts/users/{id}/scopes/{network_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: network_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Accounts]
+      operationId: removeAccountUserScope
+      summary: Remove a team manager network scope
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Scope removed }
 
   /api/v1/api-keys:
     get:
@@ -296,6 +585,37 @@ paths:
   /api/v1/networks/{id}:
     parameters:
       - $ref: "#/components/parameters/NetworkId"
+    patch:
+      tags: [Networks]
+      operationId: updateNetwork
+      summary: Update mutable network settings
+      description: |
+        Updates additive network policy. Today the key mutable field is
+        `relay_mode`, which controls relay assist for native and overlay
+        networks:
+
+        * `never`  — direct peer-to-peer only
+        * `auto`   — use relay assist during degraded bootstrap / recovery,
+          then probe back to direct
+        * `always` — force managed peerings through the account relay
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NetworkUpdate" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Network" }
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [Networks]
       operationId: deleteNetwork
@@ -398,6 +718,410 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /api/v1/devices:
+    get:
+      tags: [Devices]
+      operationId: listDevices
+      summary: List managed devices
+      description: |
+        Returns one row per managed installation. A device owns one or
+        more network memberships (node rows). This is the preferred
+        inventory surface for the dashboard's Devices page.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DeviceSummaryResponse" }
+
+  /api/v1/devices/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+    get:
+      tags: [Devices]
+      operationId: getDevice
+      summary: Get a managed device
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceSummaryResponse" }
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    patch:
+      tags: [Devices]
+      operationId: updateDevice
+      summary: Update device metadata
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateDeviceRequest" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceSummaryResponse" }
+
+  /api/v1/devices/{id}/endpoint-history:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+    get:
+      tags: [Devices]
+      operationId: getDeviceEndpointHistory
+      summary: Device-scoped endpoint history
+      description: |
+        Aggregated endpoint timeline for all memberships attached to
+        this managed device. Powers the Device detail endpoint-history tab.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceEndpointHistoryResponse" }
+
+  /api/v1/devices/{id}/peerings:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+    get:
+      tags: [Devices]
+      operationId: getDevicePeerings
+      summary: Device-scoped mesh and relay peerings
+      description: |
+        Returns the per-membership peering view used by the managed
+        Device page: direct/relayed/probing state, last handshake,
+        observed endpoint, flow counters, and any dedicated relay helpers.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DevicePeeringsResponse" }
+
+  /api/v1/devices/{id}/memberships:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+    post:
+      tags: [Devices]
+      operationId: createMembershipRequest
+      summary: Attach an existing device to another network
+      description: |
+        Creates a pending membership request for a managed device. The
+        request is fulfilled by an upgraded client via the installation-scoped
+        v2 path once it has generated a fresh WireGuard keypair locally.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateMembershipRequestBody" }
+      responses:
+        "200":
+          description: Device summary with the new pending request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceSummaryResponse" }
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/devices/{id}/memberships/{node_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+      - name: node_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Membership node UUID
+    patch:
+      tags: [Devices]
+      operationId: updateMembership
+      summary: Update a device membership
+      description: |
+        Updates membership-scoped settings such as node name, role,
+        advertised routes, host failover metadata, and native VPN
+        route-all behavior.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateMembershipRequestBody" }
+      responses:
+        "200":
+          description: Device summary with refreshed membership state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceSummaryResponse" }
+    delete:
+      tags: [Devices]
+      operationId: deleteMembership
+      summary: Remove a device from a network
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Device summary after membership deletion
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceSummaryResponse" }
+
+  /api/v1/accounts/device-profiles:
+    get:
+      tags: [Device Profiles]
+      operationId: listDeviceProfiles
+      summary: List access profiles on the current account
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/DeviceProfileResponse" }
+    post:
+      tags: [Device Profiles]
+      operationId: createDeviceProfile
+      summary: Create an access profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProfileRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceProfileResponse" }
+
+  /api/v1/accounts/device-profiles/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Device Profiles]
+      operationId: updateDeviceProfile
+      summary: Update an access profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProfileRequest" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceProfileResponse" }
+    delete:
+      tags: [Device Profiles]
+      operationId: deleteDeviceProfile
+      summary: Delete an access profile
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Deleted }
+
+  /api/v1/accounts/device-profiles/{id}/users:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Device Profiles]
+      operationId: listDeviceProfileUsers
+      summary: List users assigned to an access profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+    post:
+      tags: [Device Profiles]
+      operationId: addDeviceProfileUser
+      summary: Assign a user to an access profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Assigned
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/accounts/device-profiles/{id}/users/{user_id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: user_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Device Profiles]
+      operationId: removeDeviceProfileUser
+      summary: Remove a user from an access profile
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Removed }
+
+  /api/v1/my-access:
+    get:
+      tags: [Device Profiles]
+      operationId: getMyAccess
+      summary: Self-service access view for the current user
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MyAccessResponse" }
+
+  /api/v1/my-access/{id}/enroll-token:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Device Profiles]
+      operationId: createMyAccessEnrollToken
+      summary: Mint a self-service enrollment token for a profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Token minted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EnrollmentToken" }
+
+  /api/v1/my-access/{id}/provision:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Device Profiles]
+      operationId: createMyAccessProvisionedPeer
+      summary: Provision a self-service QR/manual peer under a profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProvisionRequest" }
+      responses:
+        "200":
+          description: Provisioned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProvisionResponse" }
+
+  /api/v1/my-access/nodes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    patch:
+      tags: [Device Profiles]
+      operationId: patchMyAccessNode
+      summary: Self-service action on a member-owned device
+      description: |
+        Used by the member self-service UI for rename, delete, and
+        VPN-through-host toggle actions gated by the assigned profile.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SelfServiceNodeAction" }
+      responses:
+        "200":
+          description: Updated self-service view
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MyAccessResponse" }
+
   /api/v1/nodes:
     get:
       tags: [Nodes]
@@ -470,6 +1194,72 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/nodes/{id}/assign:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    patch:
+      tags: [Device Profiles]
+      operationId: assignNodeOwner
+      summary: Assign or transfer node ownership
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                owner_user_id: { type: string, format: uuid, nullable: true }
+                device_profile_id: { type: string, format: uuid, nullable: true }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/nodes/{id}/claim:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    post:
+      tags: [Device Protocol v1]
+      operationId: claimNode
+      summary: Claim a managed node for the current user
+      security:
+        - deviceSecret: []
+      responses:
+        "200":
+          description: Claimed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/nodes/{id}/endpoint-history:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    get:
+      tags: [Nodes]
+      operationId: getNodeEndpointHistory
+      summary: Node-scoped endpoint history
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeEndpointHistoryResponse" }
 
   /api/v1/nodes/{id}/heartbeat:
     parameters:
@@ -617,6 +1407,96 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/V2StateResponse" }
 
+  /api/v2/devices/{id}/settings:
+    parameters:
+      - $ref: "#/components/parameters/NodeId"
+    patch:
+      tags: [Device Protocol v2]
+      operationId: patchDeviceSettings
+      summary: Patch device-side settings (strict v2)
+      description: |
+        Strict device-authenticated toggle surface used by upgraded
+        managed clients. Today this controls the device-side
+        `route_all_traffic` / VPN-through-host setting and returns the
+        refreshed desired-state document.
+      security:
+        - strictDeviceAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/V2SettingsPatch" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/V2StateResponse" }
+
+  /api/v2/installations/{id}/state:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+    get:
+      tags: [Devices]
+      operationId: getInstallationState
+      summary: Installation-scoped managed device state
+      description: |
+        Strict installation-authenticated inventory path for upgraded
+        managed connectors. Returns device identity, existing memberships,
+        and pending membership requests that can be fulfilled locally.
+      security:
+        - strictDeviceAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ProtocolVersion"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstallationStateResponse" }
+
+  /api/v2/installations/{id}/memberships/{request_id}/fulfill:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Device UUID
+      - name: request_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Pending membership request UUID
+    post:
+      tags: [Devices]
+      operationId: fulfillMembershipRequest
+      summary: Fulfill a pending device membership request
+      description: |
+        Upgraded clients call this after generating a new local keypair
+        for an additional network membership. Returns the new node identity,
+        rendered wg_config, and initial peer set.
+      security:
+        - strictDeviceAuth: []
+      parameters:
+        - $ref: "#/components/parameters/ProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FulfillMembershipRequestBody" }
+      responses:
+        "200":
+          description: Membership fulfilled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FulfillMembershipResponse" }
+
   /api/v1/nodes/{id}/upstream-exits:
     parameters:
       - $ref: "#/components/parameters/NodeId"
@@ -711,6 +1591,100 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/NodeTraffic" }
 
+  /api/v1/billing/status:
+    get:
+      tags: [Accounts]
+      operationId: getBillingStatus
+      summary: Public billing readiness probe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BillingStatusResponse" }
+
+  /api/v1/billing/checkout-session:
+    post:
+      tags: [Accounts]
+      operationId: createBillingCheckoutSession
+      summary: Create a Stripe checkout session for plan upgrade or remediation
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Checkout session created
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/billing/portal-session:
+    post:
+      tags: [Accounts]
+      operationId: createBillingPortalSession
+      summary: Create a Stripe customer portal session
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Portal session created
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/v1/billing/webhook:
+    post:
+      tags: [Accounts]
+      operationId: receiveBillingWebhook
+      summary: Stripe webhook receiver
+      description: |
+        Internal callback endpoint used by Stripe. This is mounted on the
+        public brain but authenticated by Stripe's webhook signature header,
+        not by bearer JWTs.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Webhook accepted
+
+  /api/v1/billing/remediate:
+    post:
+      tags: [Accounts]
+      operationId: remediateBillingOverage
+      summary: Restrict account resources back within plan caps
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RemediateRequest" }
+      responses:
+        "200":
+          description: Remediation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: active }
+
   /api/v1/admin/stats:
     get:
       tags: [Admin]
@@ -735,6 +1709,33 @@ paths:
       responses:
         "200":
           description: OK
+
+  /api/v1/admin/accounts/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Admin]
+      operationId: adminAccountDetail
+      summary: Deep detail for one account
+      security:
+        - adminKey: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+    delete:
+      tags: [Admin]
+      operationId: adminDeleteAccount
+      summary: Delete an account
+      security:
+        - adminKey: []
+      responses:
+        "204": { description: Deleted }
 
   /api/v1/admin/nodes:
     get:
@@ -881,6 +1882,65 @@ components:
         access_token: { type: string }
         token_type: { type: string, example: bearer }
 
+    MembershipSummary:
+      type: object
+      properties:
+        account_id: { type: string, format: uuid }
+        company_name: { type: string, nullable: true }
+        role: { type: string }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+
+    SwitchAccountRequest:
+      type: object
+      required: [account_id]
+      properties:
+        account_id: { type: string, format: uuid }
+
+    Entitlements:
+      type: object
+      additionalProperties: true
+      description: Effective plan entitlements for the current account.
+
+    AccountUsage:
+      type: object
+      properties:
+        users: { type: integer, format: int64 }
+        devices: { type: integer, format: int64 }
+        networks: { type: integer, format: int64 }
+        native_networks: { type: integer, format: int64 }
+        host_nodes: { type: integer, format: int64 }
+        pats: { type: integer, format: int64 }
+
+    BillingState:
+      type: object
+      properties:
+        configured: { type: boolean }
+        stripe_customer_present: { type: boolean }
+        subscription_status: { type: string, nullable: true }
+        plan_updated_at: { type: string, format: date-time, nullable: true }
+        state:
+          type: string
+          enum: [free, paid_healthy, payment_failed, canceled, enterprise, not_configured]
+
+    AccountMeResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        user_email: { type: string, format: email }
+        user_role: { type: string }
+        user_id: { type: string, format: uuid }
+        plan_code: { type: string }
+        plan_display_name: { type: string }
+        nominal_plan_code: { type: string }
+        nominal_plan_display_name: { type: string }
+        entitlements: { $ref: "#/components/schemas/Entitlements" }
+        usage: { $ref: "#/components/schemas/AccountUsage" }
+        billing: { $ref: "#/components/schemas/BillingState" }
+        account_state: { type: string }
+        grace_ends_at: { type: string, format: date-time, nullable: true }
+
     CreateApiKeyRequest:
       type: object
       required: [name]
@@ -947,6 +2007,14 @@ components:
         native_client_start: { type: string, nullable: true, example: "192.168.1.200" }
         native_client_end: { type: string, nullable: true, example: "192.168.1.220" }
 
+    NetworkUpdate:
+      type: object
+      properties:
+        relay_mode:
+          type: string
+          enum: [never, auto, always]
+          description: Relay assist policy for native and overlay networks.
+
     Network:
       type: object
       properties:
@@ -957,6 +2025,7 @@ components:
         network_index: { type: integer, nullable: true }
         created_at: { type: string, format: date-time }
         network_type: { type: string, enum: [overlay, native] }
+        relay_mode: { type: string, enum: [never, auto, always] }
         native_gateway_subnet: { type: string, nullable: true }
         native_host_tunnel_ip: { type: string, nullable: true }
         native_client_start: { type: string, nullable: true }
@@ -977,6 +2046,7 @@ components:
       properties:
         id: { type: string, format: uuid }
         network_id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid, nullable: true }
         node_name: { type: string }
         os_type: { type: string, nullable: true }
         role: { type: string, enum: [client, host] }
@@ -986,6 +2056,8 @@ components:
           type: array
           nullable: true
           items: { type: string }
+        host_priority: { type: integer, nullable: true }
+        host_lan_ip: { type: string, nullable: true }
         last_seen: { type: string, format: date-time, nullable: true }
         is_online: { type: boolean }
         last_endpoint: { type: string, nullable: true }
@@ -993,6 +2065,12 @@ components:
         rx_bytes: { type: integer, format: int64 }
         route_all_traffic: { type: boolean }
         route_all_active: { type: boolean }
+        device_kind: { type: string, enum: [managed, provisioned] }
+        upstream_exit_last_handshake: { type: string, format: date-time, nullable: true }
+        upstream_exit_interface_up: { type: boolean, nullable: true }
+        upstream_exit_health_updated_at: { type: string, format: date-time, nullable: true }
+        owner_user_id: { type: string, format: uuid, nullable: true }
+        device_profile_id: { type: string, format: uuid, nullable: true }
 
     Presence:
       type: string
@@ -1017,6 +2095,12 @@ components:
             presence: { $ref: "#/components/schemas/Presence" }
             observed_endpoint: { type: string, nullable: true }
             last_activity: { type: string, format: date-time, nullable: true }
+            upstream_exit_health: { $ref: "#/components/schemas/UpstreamExitHealth" }
+            host_exit_health: { $ref: "#/components/schemas/UpstreamExitHealth" }
+            mesh_mode:
+              type: string
+              nullable: true
+              description: direct, relayed, or probing_recovery when assisted mesh is active
 
     NodeUpdate:
       type: object
@@ -1039,13 +2123,25 @@ components:
       type: object
       properties:
         endpoint: { type: string, nullable: true }
+        installation_id: { type: string, format: uuid, nullable: true }
+        capabilities:
+          type: array
+          nullable: true
+          items: { type: string }
         tx_bytes: { type: integer, format: int64, nullable: true }
         rx_bytes: { type: integer, format: int64, nullable: true }
+        host_lan_ip: { type: string, nullable: true }
         peers:
           type: array
           nullable: true
           items: { $ref: "#/components/schemas/ObservedPeer" }
+        telemetry:
+          nullable: true
+          $ref: "#/components/schemas/V2DeviceTelemetry"
         route_all_active: { type: boolean, nullable: true }
+        upstream_exit_health:
+          nullable: true
+          $ref: "#/components/schemas/UpstreamExitHealthReport"
 
     ObservedPeer:
       type: object
@@ -1063,10 +2159,21 @@ components:
         peers:
           type: array
           items: { $ref: "#/components/schemas/PeerConfig" }
+        probe_peers:
+          type: array
+          items: { $ref: "#/components/schemas/ProbePeerConfig" }
         upstream_exit:
           nullable: true
           $ref: "#/components/schemas/HostUpstreamExit"
         config_version: { type: integer, format: int64 }
+        collect_device_telemetry: { type: boolean }
+
+    ProbePeerConfig:
+      type: object
+      properties:
+        public_key: { type: string }
+        endpoint: { type: string, nullable: true }
+        persistent_keepalive: { type: integer, format: int32, nullable: true }
 
     HostUpstreamExit:
       type: object
@@ -1080,6 +2187,9 @@ components:
       type: object
       properties:
         wg_config: { type: string, description: "Full wg_config text with PrivateKey placeholder preserved" }
+        probe_peers:
+          type: array
+          items: { $ref: "#/components/schemas/ProbePeerConfig" }
         config_version: { type: integer, format: int64 }
         device_kind: { type: string, enum: [managed, provisioned] }
 
@@ -1136,6 +2246,7 @@ components:
       required: [token, node_name, public_key]
       properties:
         token: { type: string }
+        installation_id: { type: string, format: uuid, nullable: true }
         node_name: { type: string }
         public_key: { type: string, description: "WireGuard public key, base64" }
         os_type: { type: string, nullable: true }
@@ -1153,6 +2264,8 @@ components:
       type: object
       properties:
         node_id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid, nullable: true }
+        installation_id: { type: string, format: uuid, nullable: true }
         overlay_ip: { type: string }
         network_type: { type: string, enum: [overlay, native] }
         device_secret:
@@ -1224,24 +2337,70 @@ components:
         tx_bytes_lifetime: { type: integer, format: int64, nullable: true }
         rx_bytes_lifetime: { type: integer, format: int64, nullable: true }
         route_all_active: { type: boolean, nullable: true }
+        host_lan_ip: { type: string, nullable: true }
         peers:
           type: array
           nullable: true
           items: { $ref: "#/components/schemas/ObservedPeer" }
+        telemetry:
+          nullable: true
+          $ref: "#/components/schemas/V2DeviceTelemetry"
         last_convergence_errors:
           type: array
           nullable: true
           items: { type: string }
 
+    V2DeviceTelemetry:
+      type: object
+      properties:
+        battery:
+          nullable: true
+          $ref: "#/components/schemas/V2BatteryTelemetry"
+        cpu:
+          nullable: true
+          $ref: "#/components/schemas/V2CpuTelemetry"
+        memory:
+          nullable: true
+          $ref: "#/components/schemas/V2MemoryTelemetry"
+
+    V2BatteryTelemetry:
+      type: object
+      properties:
+        level_percent: { type: integer, nullable: true }
+        charging: { type: boolean, nullable: true }
+        status: { type: string, nullable: true }
+        health: { type: string, nullable: true }
+        temperature_c: { type: number, nullable: true }
+        voltage_mv: { type: integer, nullable: true }
+
+    V2CpuTelemetry:
+      type: object
+      properties:
+        system_usage_percent: { type: number, nullable: true }
+        app_usage_percent: { type: number, nullable: true }
+        sample_window_ms: { type: integer, format: int64, nullable: true }
+
+    V2MemoryTelemetry:
+      type: object
+      properties:
+        total_bytes: { type: integer, format: int64, nullable: true }
+        available_bytes: { type: integer, format: int64, nullable: true }
+        app_pss_bytes: { type: integer, format: int64, nullable: true }
+        low_memory: { type: boolean, nullable: true }
+
     V2StateResponse:
       type: object
       properties:
         node_id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid, nullable: true }
+        installation_id: { type: string, format: uuid, nullable: true }
         overlay_ip: { type: string }
         network_type: { type: string, enum: [overlay, native] }
         device_kind: { type: string, enum: [managed, provisioned] }
         config_version: { type: integer, format: int64 }
         desired_state: { $ref: "#/components/schemas/V2DesiredState" }
+        host_exit_health: { $ref: "#/components/schemas/UpstreamExitHealth" }
+        collect_device_telemetry: { type: boolean }
         server_time: { type: string, format: date-time }
         required_capabilities:
           type: array
@@ -1258,8 +2417,37 @@ components:
         peers:
           type: array
           items: { $ref: "#/components/schemas/PeerConfig" }
+        probe_peers:
+          type: array
+          items: { $ref: "#/components/schemas/ProbePeerConfig" }
         upstream_exit: { $ref: "#/components/schemas/V2UpstreamExit" }
         route_all_traffic: { type: boolean }
+        lan_publication: { $ref: "#/components/schemas/V2LanPublication" }
+
+    V2SettingsPatch:
+      type: object
+      properties:
+        route_all_traffic:
+          type: boolean
+          description: Toggle VPN-through-host / default-route behavior for this device.
+
+    V2LanPublication:
+      type: object
+      properties:
+        enabled: { type: boolean }
+        native_gateway_subnet: { type: string }
+        published_clients:
+          type: array
+          items: { $ref: "#/components/schemas/V2PublishedClient" }
+
+    V2PublishedClient:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        node_name: { type: string }
+        overlay_ip: { type: string }
+        presence: { $ref: "#/components/schemas/Presence" }
+        device_kind: { type: string, enum: [managed, provisioned] }
 
     V2UpstreamExit:
       oneOf:
@@ -1275,6 +2463,398 @@ components:
             name: { type: string }
             provider_type: { type: string }
             wg_config: { type: string }
+
+    UpstreamExitHealth:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [unknown, healthy, degraded, down, never]
+        last_handshake: { type: string, format: date-time, nullable: true }
+        last_updated: { type: string, format: date-time, nullable: true }
+        interface_up: { type: boolean, nullable: true }
+        message: { type: string }
+
+    UpstreamExitHealthReport:
+      type: object
+      properties:
+        interface_up: { type: boolean }
+        last_handshake:
+          type: integer
+          format: int64
+          nullable: true
+          description: Unix seconds of the most recent upstream-exit handshake.
+
+    DeviceMembershipSummary:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        network_id: { type: string, format: uuid }
+        network_name: { type: string }
+        network_type: { type: string, enum: [overlay, native] }
+        relay_mode: { type: string, enum: [never, auto, always] }
+        node_name: { type: string }
+        os_type: { type: string, nullable: true }
+        role: { type: string, enum: [client, host] }
+        overlay_ip: { type: string }
+        advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+        host_priority: { type: integer, nullable: true }
+        host_lan_ip: { type: string, nullable: true }
+        route_all_traffic: { type: boolean }
+        route_all_active: { type: boolean }
+        config_version: { type: integer, format: int64 }
+        is_online: { type: boolean }
+        last_seen: { type: string, format: date-time, nullable: true }
+        native_host_role: { type: string, nullable: true }
+        native_host_state: { type: string, nullable: true }
+        owner_user_id: { type: string, format: uuid, nullable: true }
+        device_profile_id: { type: string, format: uuid, nullable: true }
+
+    DeviceMembershipRequestSummary:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        network_id: { type: string, format: uuid }
+        network_name: { type: string }
+        desired_role: { type: string, enum: [client, host] }
+        desired_name: { type: string, nullable: true }
+        desired_advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+        status: { type: string, example: pending }
+        requested_by_user_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+        fulfilled_at: { type: string, format: date-time, nullable: true }
+
+    DeviceSummaryResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        installation_id: { type: string, format: uuid }
+        owner_user_id: { type: string, format: uuid, nullable: true }
+        display_name: { type: string }
+        os_type: { type: string, nullable: true }
+        device_kind: { type: string, enum: [managed, provisioned] }
+        reported_capabilities:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time, nullable: true }
+        collect_device_telemetry: { type: boolean }
+        latest_device_telemetry:
+          nullable: true
+          $ref: "#/components/schemas/V2DeviceTelemetry"
+        telemetry_updated_at: { type: string, format: date-time, nullable: true }
+        memberships:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceMembershipSummary" }
+        pending_membership_requests:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceMembershipRequestSummary" }
+
+    AssignedUser:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email }
+
+    DeviceProfileResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        allowed_network_ids:
+          type: array
+          items: { type: string, format: uuid }
+        device_limit: { type: integer, format: int64, nullable: true }
+        device_count: { type: integer, format: int64 }
+        allowed_device_kind: { type: string }
+        allowed_roles:
+          type: array
+          items: { type: string }
+        allow_rename: { type: boolean }
+        allow_delete: { type: boolean }
+        allow_route_all: { type: boolean }
+        default_route_mode: { type: string }
+        egress_cidrs:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+        assigned_users:
+          type: array
+          items: { $ref: "#/components/schemas/AssignedUser" }
+
+    CreateProfileRequest:
+      type: object
+      required: [name, allowed_network_ids]
+      properties:
+        name: { type: string }
+        description: { type: string, nullable: true }
+        allowed_network_ids:
+          type: array
+          items: { type: string, format: uuid }
+        device_limit: { type: integer, format: int64, nullable: true }
+        allowed_device_kind: { type: string, default: both }
+        allowed_roles:
+          type: array
+          items: { type: string }
+        allow_rename: { type: boolean }
+        allow_delete: { type: boolean }
+        allow_route_all: { type: boolean }
+        default_route_mode: { type: string, default: off }
+        egress_cidrs:
+          type: array
+          items: { type: string }
+
+    UpdateDeviceRequest:
+      type: object
+      properties:
+        display_name: { type: string }
+        collect_device_telemetry: { type: boolean }
+
+    CreateMembershipRequestBody:
+      type: object
+      required: [network_id]
+      properties:
+        network_id: { type: string, format: uuid }
+        desired_role: { type: string, enum: [client, host], nullable: true }
+        desired_name: { type: string, nullable: true }
+        desired_advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+
+    UpdateMembershipRequestBody:
+      type: object
+      properties:
+        node_name: { type: string, nullable: true }
+        role: { type: string, enum: [client, host], nullable: true }
+        advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+        host_priority: { type: integer, nullable: true }
+        host_lan_ip: { type: string, nullable: true }
+        route_all_traffic: { type: boolean, nullable: true }
+
+    DeviceEndpointHistoryEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        node_name: { type: string }
+        network_id: { type: string, format: uuid }
+        network_name: { type: string }
+        overlay_ip: { type: string }
+        endpoint: { type: string }
+        source: { type: string }
+        observed_at: { type: string, format: date-time }
+
+    DeviceEndpointHistoryResponse:
+      type: object
+      properties:
+        device_id: { type: string, format: uuid }
+        retention_days: { type: integer, format: int64 }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceEndpointHistoryEntry" }
+
+    NodeEndpointHistoryEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        endpoint: { type: string }
+        source: { type: string }
+        observed_at: { type: string, format: date-time }
+
+    NodeEndpointHistoryResponse:
+      type: object
+      properties:
+        node_id: { type: string, format: uuid }
+        retention_days: { type: integer, format: int64 }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/NodeEndpointHistoryEntry" }
+
+    DevicePeeringEntry:
+      type: object
+      properties:
+        peer_node_id: { type: string, format: uuid }
+        peer_device_id: { type: string, format: uuid, nullable: true }
+        peer_device_name: { type: string, nullable: true }
+        peer_node_name: { type: string }
+        peer_network_id: { type: string, format: uuid }
+        peer_network_name: { type: string }
+        peer_overlay_ip: { type: string }
+        peer_role: { type: string, enum: [client, host] }
+        peer_os_type: { type: string, nullable: true }
+        peer_device_kind: { type: string, enum: [managed, provisioned] }
+        relationship_mode: { type: string, example: direct }
+        mode_changed_at: { type: string, format: date-time, nullable: true }
+        probe_started_at: { type: string, format: date-time, nullable: true }
+        direct_failures: { type: integer }
+        last_handshake: { type: string, format: date-time, nullable: true }
+        sampled_at: { type: string, format: date-time, nullable: true }
+        rx_bytes: { type: integer, format: int64 }
+        tx_bytes: { type: integer, format: int64 }
+        last_observed_endpoint: { type: string, nullable: true }
+        peer_last_seen: { type: string, format: date-time, nullable: true }
+        peer_is_online: { type: boolean }
+
+    DeviceRelayHelperEntry:
+      type: object
+      properties:
+        helper_name: { type: string }
+        endpoint: { type: string }
+        public_key: { type: string }
+        connection_state: { type: string }
+        relationship_mode: { type: string }
+        mode_changed_at: { type: string, format: date-time, nullable: true }
+        probe_started_at: { type: string, format: date-time, nullable: true }
+        active_peer_count: { type: integer }
+        last_handshake: { type: string, format: date-time, nullable: true }
+        sampled_at: { type: string, format: date-time, nullable: true }
+        rx_bytes: { type: integer, format: int64 }
+        tx_bytes: { type: integer, format: int64 }
+
+    DeviceMembershipPeerings:
+      type: object
+      properties:
+        membership: { $ref: "#/components/schemas/DeviceMembershipSummary" }
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/DevicePeeringEntry" }
+        relay_helpers:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceRelayHelperEntry" }
+
+    DevicePeeringsResponse:
+      type: object
+      properties:
+        device_id: { type: string, format: uuid }
+        memberships:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceMembershipPeerings" }
+
+    InstallationStateResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        installation_id: { type: string, format: uuid }
+        display_name: { type: string }
+        os_type: { type: string, nullable: true }
+        device_kind: { type: string, enum: [managed, provisioned] }
+        reported_capabilities:
+          type: array
+          items: { type: string }
+        last_seen: { type: string, format: date-time, nullable: true }
+        collect_device_telemetry: { type: boolean }
+        latest_device_telemetry:
+          nullable: true
+          $ref: "#/components/schemas/V2DeviceTelemetry"
+        telemetry_updated_at: { type: string, format: date-time, nullable: true }
+        memberships:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceMembershipSummary" }
+        pending_membership_requests:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceMembershipRequestSummary" }
+
+    FulfillMembershipRequestBody:
+      type: object
+      required: [public_key]
+      properties:
+        public_key: { type: string }
+        node_name: { type: string, nullable: true }
+        os_type: { type: string, nullable: true }
+        endpoint: { type: string, nullable: true }
+        advertised_routes:
+          type: array
+          nullable: true
+          items: { type: string }
+        host_lan_ip: { type: string, nullable: true }
+
+    FulfillMembershipResponse:
+      type: object
+      properties:
+        device_id: { type: string, format: uuid }
+        installation_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        overlay_ip: { type: string }
+        network_type: { type: string, enum: [overlay, native] }
+        config_version: { type: integer, format: int64 }
+        wg_config: { type: string }
+        peers:
+          type: array
+          items: { $ref: "#/components/schemas/PeerConfig" }
+
+    MyAccessNode:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_name: { type: string }
+        overlay_ip: { type: string }
+        role: { type: string, enum: [client, host] }
+        os_type: { type: string, nullable: true }
+        network_id: { type: string, format: uuid }
+        device_profile_id: { type: string, format: uuid, nullable: true }
+        device_kind: { type: string, enum: [managed, provisioned] }
+        is_online: { type: boolean }
+        route_all_traffic: { type: boolean }
+        host_exit_health: { $ref: "#/components/schemas/UpstreamExitHealth" }
+
+    MyAccessResponse:
+      type: object
+      properties:
+        profiles:
+          type: array
+          items: { $ref: "#/components/schemas/DeviceProfileResponse" }
+        nodes:
+          type: array
+          items: { $ref: "#/components/schemas/MyAccessNode" }
+
+    SelfServiceNodeAction:
+      type: object
+      additionalProperties: true
+      description: Self-service node action body for rename, delete, and route-all toggles.
+
+    BillingPlansPriced:
+      type: object
+      properties:
+        basic: { type: boolean }
+        team_starter: { type: boolean }
+        teams: { type: boolean }
+        large_teams: { type: boolean }
+
+    BillingStatusResponse:
+      type: object
+      properties:
+        configured: { type: boolean }
+        secret_key_configured: { type: boolean }
+        webhook_configured: { type: boolean }
+        plans_priced: { $ref: "#/components/schemas/BillingPlansPriced" }
+
+    RemediateRequest:
+      type: object
+      properties:
+        keep_network_ids:
+          type: array
+          items: { type: string, format: uuid }
+        keep_node_ids:
+          type: array
+          items: { type: string, format: uuid }
+        keep_membership_ids:
+          type: array
+          items: { type: string, format: uuid }
 
     AdminStats:
       type: object

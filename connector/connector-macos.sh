@@ -26,6 +26,8 @@ set -euo pipefail
 # ── Constants ─────────────────────────────────────────────────────────────────
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
+INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
+DEVICE_ID_FILE="/etc/wireguard/device_id"
 KEY_DIR="/etc/wireguard/wg0"
 PRIV_KEY_FILE="${KEY_DIR}/private.key"
 PUB_KEY_FILE="${KEY_DIR}/public.key"
@@ -43,6 +45,20 @@ WG_WATCHDOG_PLIST="/Library/LaunchDaemons/io.wg0.wireguard.plist"
 log()  { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
 die()  { log "ERROR: $*" >&2; exit 1; }
 warn() { log "WARNING: $*" >&2; }
+
+get_or_create_installation_id() {
+    local iid=""
+    if [[ -f "$INSTALLATION_ID_FILE" ]]; then
+        iid="$(cat "$INSTALLATION_ID_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -z "$iid" ]]; then
+        iid="$(uuidgen 2>/dev/null || true)"
+        [[ -n "$iid" ]] || die "Unable to generate installation_id"
+        printf '%s' "$iid" > "$INSTALLATION_ID_FILE"
+        chmod 600 "$INSTALLATION_ID_FILE"
+    fi
+    printf '%s' "$iid"
+}
 
 # ── Must run as root ──────────────────────────────────────────────────────────
 [[ "$EUID" -eq 0 ]] || die "This script must be run with sudo."
@@ -71,16 +87,56 @@ write_heartbeat_script() {
 export PATH="${BREW_PREFIX}/bin:${BREW_PREFIX}/sbin:\$PATH"
 NODE_ID="\$(cat ${NODE_ID_FILE})"
 ROUTE_ALL_STATE="${KEY_DIR}/route_all_state"
+ROUTE_ALL_DNS_STATE="${KEY_DIR}/route_all_dns_state"
 SAME_LAN_STATE="${KEY_DIR}/same_lan_state"
 OVERLAY_IP_FILE="${KEY_DIR}/overlay_ip"
+COLLECT_TELEMETRY_STATE="${KEY_DIR}/collect_device_telemetry"
+
+find_bin() {
+    local name="\$1"
+    for path in \
+        "${BREW_PREFIX}/bin/\${name}" \
+        "${BREW_PREFIX}/sbin/\${name}" \
+        "/usr/local/bin/\${name}" \
+        "/usr/local/sbin/\${name}" \
+        "/usr/bin/\${name}" \
+        "/usr/sbin/\${name}"; do
+        [[ -n "\$path" && -x "\$path" ]] && { printf '%s' "\$path"; return 0; }
+    done
+    printf '%s' "\$name"
+}
+
+WG_BIN=\$(find_bin wg)
+WG_QUICK_BIN=\$(find_bin wg-quick)
+
+resolve_wg_real() {
+    local name up_name iface_list candidate
+    name=\$(cat /var/run/wireguard/${WG_IFACE}.name 2>/dev/null | tr -d '[:space:]')
+    if [[ -n "\$name" ]] && "\$WG_BIN" show "\$name" >/dev/null 2>&1; then
+        printf '%s' "\$name"
+        return 0
+    fi
+    if "\$WG_BIN" show "${WG_IFACE}" >/dev/null 2>&1; then
+        printf '%s' "${WG_IFACE}"
+        return 0
+    fi
+    up_name=\$(cat /var/run/wireguard/wg0-up.name 2>/dev/null | tr -d '[:space:]')
+    iface_list=\$("\$WG_BIN" show interfaces 2>/dev/null || true)
+    for candidate in \$iface_list; do
+        [[ -n "\$up_name" && "\$candidate" == "\$up_name" ]] && continue
+        printf '%s' "\$candidate"
+        return 0
+    done
+    return 1
+}
 
 # macOS userspace WireGuard maps the logical name (wg0) to a utun device.
 # Every wg/route call must use the real utun name, not the logical alias.
-WG_REAL=\$(cat /var/run/wireguard/${WG_IFACE}.name 2>/dev/null | tr -d '[:space:]')
+WG_REAL=\$(resolve_wg_real || true)
 [[ -z "\$WG_REAL" ]] && WG_REAL="${WG_IFACE}"
 
 # If wireguard-go is not running, skip — the watchdog will restart it.
-wg show "\$WG_REAL" >/dev/null 2>&1 || exit 0
+"\$WG_BIN" show "\$WG_REAL" >/dev/null 2>&1 || exit 0
 
 # Device protocol v2 secret (see docs/DEVICE_PROTOCOL.md). Empty string
 # for nodes enrolled before v2 — the brain's grace-period path accepts
@@ -92,7 +148,7 @@ ENDPOINT=""
 [[ -n "\$PUBLIC_IP" ]] && ENDPOINT="\${PUBLIC_IP}:51820"
 
 # Collect TX/RX bytes from WireGuard (wg show transfer: <pubkey> <rx> <tx>)
-TRANSFER=\$(wg show "\$WG_REAL" transfer 2>/dev/null)
+TRANSFER=\$("\$WG_BIN" show "\$WG_REAL" transfer 2>/dev/null)
 TX_BYTES=\$(echo "\$TRANSFER" | awk '{sum += \$3} END {print sum+0}')
 RX_BYTES=\$(echo "\$TRANSFER" | awk '{sum += \$2} END {print sum+0}')
 
@@ -104,7 +160,7 @@ RX_BYTES=\$(echo "\$TRANSFER" | awk '{sum += \$2} END {print sum+0}')
 # "never," which we map to JSON null so the brain's Option<i64> is
 # honest about missing data. jq -Rsc builds the JSON safely — no
 # string concat, pubkeys are untrusted.
-PEERS_JSON=\$(wg show "\$WG_REAL" dump 2>/dev/null | tail -n +2 | awk -F'\\t' 'NF>=8 {
+PEERS_JSON=\$("\$WG_BIN" show "\$WG_REAL" dump 2>/dev/null | tail -n +2 | awk -F'\\t' 'NF>=8 {
     printf "%s\\t%s\\t%s\\t%s\\n", \$1, \$5, \$6, \$7
 }' | jq -Rsc '
     split("\\n") | map(select(length > 0) | split("\\t") | {
@@ -128,6 +184,122 @@ else
     ROUTE_ALL_ACTIVE=false
 fi
 
+current_capabilities_json() {
+    # See connector.sh for the multi_membership_v1 rationale. macOS
+    # connector inherits the same per-interface state-dir model
+    # (/etc/wireguard/wgN) so advertising this capability is safe.
+    jq -cn '[
+        "same_lan_detection",
+        "split_tunnel_macos",
+        "byo_exit_macos",
+        "assisted_relay_probe_peers_v1",
+        "peer_observations",
+        "device_telemetry_v1",
+        "desired_state_convergence",
+        "multi_membership_v1"
+    ]'
+}
+
+is_ipv4_cidr() {
+    local value="\${1:-}"
+    [[ "\$value" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]
+}
+
+first_valid_ipv4_cidr() {
+    local raw="\${1:-}" route
+    IFS=',' read -ra routes <<< "\$raw"
+    for route in "\${routes[@]}"; do
+        route=\$(echo "\$route" | xargs)
+        [[ -z "\$route" ]] && continue
+        if is_ipv4_cidr "\$route"; then
+            printf '%s\n' "\$route"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_host_lan_ip() {
+    [[ "\$ROLE" == "host" ]] || { echo ""; return; }
+    [[ -n "\$ADVERTISED_ROUTES_CSV" ]] || { echo ""; return; }
+
+    local iface="" first_route="" probe_ip=""
+    first_route=\$(first_valid_ipv4_cidr "\$ADVERTISED_ROUTES_CSV" || true)
+    if [[ -n "\$first_route" ]]; then
+        probe_ip=\$(echo "\$first_route" | cut -d/ -f1)
+        iface=\$( { /usr/sbin/route -n get "\$probe_ip" 2>/dev/null || true; } | awk '/interface:/{print \$2; exit}')
+    fi
+    [[ -n "\$iface" ]] || iface=\$(/usr/sbin/route -n get default 2>/dev/null | awk '/interface:/{print \$2; exit}')
+    [[ -n "\$iface" ]] || { echo ""; return; }
+
+    /usr/sbin/ipconfig getifaddr "\$iface" 2>/dev/null \
+        || /sbin/ifconfig "\$iface" 2>/dev/null | awk '/inet /{print \$2; exit}'
+}
+
+collect_battery_json() {
+    local batt percent status charging=false
+    batt=\$(pmset -g batt 2>/dev/null | tail -1)
+    [[ -n "\$batt" ]] || { echo "null"; return; }
+    percent=\$(echo "\$batt" | sed -n 's/.* \([0-9][0-9]*\)%;.*/\1/p')
+    status=\$(echo "\$batt" | awk -F'; *' 'NF >= 2 { print \$2; exit }' | tr '[:upper:]' '[:lower:]')
+    [[ -n "\$percent" || -n "\$status" ]] || { echo "null"; return; }
+    [[ "\$status" == charging* || "\$status" == "charged" ]] && charging=true
+    jq -cn \
+        --argjson level_percent "\${percent:-null}" \
+        --argjson charging "\$charging" \
+        --arg status "\$status" \
+        '{level_percent:\$level_percent, charging:\$charging, status:(\$status | select(length > 0)), health:null, temperature_c:null, voltage_mv:null}'
+}
+
+collect_cpu_json() {
+    local logical_cpu total_cpu app_cpu
+    logical_cpu=\$(sysctl -n hw.logicalcpu 2>/dev/null || echo 1)
+    total_cpu=\$(ps -A -o %cpu= 2>/dev/null | awk -v cores="\$logical_cpu" '{sum += \$1} END { if (cores <= 0) cores = 1; v = sum / cores; if (v < 0) v = 0; if (v > 100) v = 100; printf "%.2f", v }')
+    app_cpu=\$(ps -o %cpu= -p $$ 2>/dev/null | awk '{print \$1; exit}')
+    [[ -n "\$total_cpu" || -n "\$app_cpu" ]] || { echo "null"; return; }
+    jq -cn \
+        --argjson system_usage_percent "\${total_cpu:-null}" \
+        --argjson app_usage_percent "\${app_cpu:-null}" \
+        --argjson sample_window_ms 30000 \
+        '{system_usage_percent:\$system_usage_percent, app_usage_percent:\$app_usage_percent, sample_window_ms:\$sample_window_ms}'
+}
+
+collect_memory_json() {
+    local total_bytes page_size free_pages speculative_pages inactive_pages available_bytes rss_kb low_memory
+    total_bytes=\$(sysctl -n hw.memsize 2>/dev/null || echo "")
+    page_size=\$(vm_stat 2>/dev/null | awk '/page size of/ {gsub("\\.", "", \$8); print \$8; exit}')
+    free_pages=\$(vm_stat 2>/dev/null | awk '/Pages free/ {gsub("\\.", "", \$3); print \$3; exit}')
+    speculative_pages=\$(vm_stat 2>/dev/null | awk '/Pages speculative/ {gsub("\\.", "", \$3); print \$3; exit}')
+    inactive_pages=\$(vm_stat 2>/dev/null | awk '/Pages inactive/ {gsub("\\.", "", \$3); print \$3; exit}')
+    [[ -n "\$total_bytes" && -n "\$page_size" ]] || { echo "null"; return; }
+    available_bytes=\$(( (free_pages + speculative_pages + inactive_pages) * page_size ))
+    rss_kb=\$(ps -o rss= -p $$ 2>/dev/null | awk '{print \$1; exit}')
+    low_memory=\$(awk -v a="\$available_bytes" -v t="\$total_bytes" 'BEGIN { print (t > 0 && (a / t) < 0.10) ? "true" : "false" }')
+    jq -cn \
+        --argjson total_bytes "\$total_bytes" \
+        --argjson available_bytes "\$available_bytes" \
+        --argjson app_pss_bytes "\${rss_kb:-0}" \
+        --argjson low_memory "\$low_memory" \
+        '{total_bytes:\$total_bytes, available_bytes:\$available_bytes, app_pss_bytes:(\$app_pss_bytes * 1024), low_memory:\$low_memory}'
+}
+
+collect_device_telemetry_json() {
+    [[ "\$(cat "\$COLLECT_TELEMETRY_STATE" 2>/dev/null || echo off)" == "on" ]] || { echo "null"; return; }
+    local battery_json cpu_json memory_json
+    battery_json=\$(collect_battery_json)
+    cpu_json=\$(collect_cpu_json)
+    memory_json=\$(collect_memory_json)
+    if [[ "\$battery_json" == "null" && "\$cpu_json" == "null" && "\$memory_json" == "null" ]]; then
+        echo "null"
+        return
+    fi
+    jq -cn \
+        --argjson battery "\$battery_json" \
+        --argjson cpu "\$cpu_json" \
+        --argjson memory "\$memory_json" \
+        '{battery:\$battery, cpu:\$cpu, memory:\$memory}'
+}
+
 # BYO Exit kill-switch health probe. If a previous heartbeat's BYO
 # state machine brought up wg0-up via wg-quick, we can read its
 # current handshake timestamp via \`wg show\` and report it to the
@@ -139,11 +311,11 @@ fi
 UPSTREAM_HEALTH_JSON="null"
 if [[ -f "/var/run/wireguard/wg0-up.name" ]]; then
     WG_UP_REAL=\$(cat /var/run/wireguard/wg0-up.name 2>/dev/null | tr -d '[:space:]')
-    if [[ -n "\$WG_UP_REAL" ]] && wg show "\$WG_UP_REAL" >/dev/null 2>&1; then
+    if [[ -n "\$WG_UP_REAL" ]] && "\$WG_BIN" show "\$WG_UP_REAL" >/dev/null 2>&1; then
         # latest-handshakes output is "<pubkey>\\t<unix_seconds>"
         # per peer. 0 means "never handshook." Take the max across
         # all peers (there's usually one — the provider's endpoint).
-        WG_UP_LAST_HS=\$(wg show "\$WG_UP_REAL" latest-handshakes 2>/dev/null | awk '{ if (\$2 > 0) print \$2 }' | sort -nr | head -1)
+        WG_UP_LAST_HS=\$("\$WG_BIN" show "\$WG_UP_REAL" latest-handshakes 2>/dev/null | awk '{ if (\$2 > 0) print \$2 }' | sort -nr | head -1)
         if [[ -n "\$WG_UP_LAST_HS" ]]; then
             UPSTREAM_HEALTH_JSON=\$(jq -cn --argjson lh "\$WG_UP_LAST_HS" '{interface_up: true, last_handshake: \$lh}')
         else
@@ -156,20 +328,44 @@ if [[ -f "/var/run/wireguard/wg0-up.name" ]]; then
     fi
 fi
 
+CAPABILITIES_JSON=\$(current_capabilities_json)
+HOST_LAN_IP=\$(detect_host_lan_ip)
+HOST_LAN_IP_JSON=\$(jq -Rn --arg v "\$HOST_LAN_IP" 'if (\$v | length) > 0 then \$v else null end')
+INSTALLATION_ID_JSON=\$(jq -Rn --arg v "\$(cat ${INSTALLATION_ID_FILE} 2>/dev/null || echo "")" 'if (\$v | length) > 0 then \$v else null end')
+TELEMETRY_JSON=\$(collect_device_telemetry_json)
+
 HB_BODY=\$(jq -cn \\
     --arg endpoint "\$ENDPOINT" \\
+    --argjson installation_id "\$INSTALLATION_ID_JSON" \\
+    --argjson capabilities "\$CAPABILITIES_JSON" \\
     --argjson tx_bytes \$TX_BYTES \\
     --argjson rx_bytes \$RX_BYTES \\
     --argjson peers "\$PEERS_JSON" \\
     --argjson route_all_active \$ROUTE_ALL_ACTIVE \\
+    --argjson host_lan_ip "\$HOST_LAN_IP_JSON" \\
     --argjson upstream_exit_health "\$UPSTREAM_HEALTH_JSON" \\
-    '{endpoint:\$endpoint, tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, peers:\$peers, route_all_active:\$route_all_active, upstream_exit_health:\$upstream_exit_health}')
+    --argjson telemetry "\$TELEMETRY_JSON" \\
+    '{endpoint:\$endpoint, installation_id:\$installation_id, capabilities:\$capabilities,
+      host_lan_ip:\$host_lan_ip, tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, peers:\$peers,
+      route_all_active:\$route_all_active, upstream_exit_health:\$upstream_exit_health,
+      telemetry:\$telemetry}')
 
 CURL_ARGS=( -sf -X POST -H "Content-Type: application/json" )
 [[ -n "\$DEVICE_SECRET" ]] && CURL_ARGS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
 RESPONSE=\$(curl "\${CURL_ARGS[@]}" \\
     -d "\$HB_BODY" \\
-    "${BRAIN_URL}/api/v1/nodes/\${NODE_ID}/heartbeat" 2>/dev/null) || exit 0
+    "${BRAIN_URL}/api/v1/nodes/\${NODE_ID}/heartbeat" 2>/dev/null) || {
+        if [[ "\${WG0_HEARTBEAT_STRICT:-0}" == "1" ]]; then
+            exit 1
+        fi
+        exit 0
+    }
+
+if [[ "\$(echo "\$RESPONSE" | jq -r '.collect_device_telemetry // false' 2>/dev/null)" == "true" ]]; then
+    echo "on" > "\$COLLECT_TELEMETRY_STATE"
+else
+    echo "off" > "\$COLLECT_TELEMETRY_STATE"
+fi
 
 # ── Config drift detection (device protocol v2) ──────────────────────────
 # Heartbeat response carries \`config_version\`. If the brain advertises a
@@ -194,7 +390,7 @@ if [[ "\$REMOTE_CONFIG_VERSION" -gt "\$LOCAL_CONFIG_VERSION" ]]; then
             mv -f "\$TMP_CONF" "${WG_CONF}"
             # macOS: wg syncconf targets the utun device, not the
             # logical wg0 alias. wg-quick strip is the same on macOS.
-            wg syncconf "\$WG_REAL" <(wg-quick strip "${WG_CONF}") 2>/dev/null || true
+            "\$WG_BIN" syncconf "\$WG_REAL" <("\$WG_QUICK_BIN" strip "${WG_CONF}") 2>/dev/null || true
             echo "\$REMOTE_CONFIG_VERSION" > "${CONFIG_VERSION_FILE}"
             chmod 600 "${CONFIG_VERSION_FILE}"
         fi
@@ -243,6 +439,56 @@ get_phys_default() {
     '
 }
 
+get_network_service_for_iface() {
+    local iface="\$1"
+    networksetup -listnetworkserviceorder 2>/dev/null | awk -v iface="\$iface" '
+        /^\([^)]+\) / {
+            svc=\$0
+            sub(/^\([^)]+\) /, "", svc)
+        }
+        /Device: / {
+            if (index(\$0, "Device: " iface) > 0) {
+                print svc
+                exit
+            }
+        }
+    '
+}
+
+get_current_dns_servers() {
+    local service="\$1"
+    local out
+    out="\$(networksetup -getdnsservers "\$service" 2>/dev/null || true)"
+    if echo "\$out" | grep -q "There aren't any DNS Servers set on"; then
+        return 0
+    fi
+    echo "\$out" | awk 'NF { print }'
+}
+
+set_service_dns_servers() {
+    local service="\$1"
+    shift || true
+    if [[ "\$#" -eq 0 ]]; then
+        networksetup -setdnsservers "\$service" Empty >/dev/null 2>&1 || true
+    else
+        networksetup -setdnsservers "\$service" "\$@" >/dev/null 2>&1 || true
+    fi
+}
+
+restore_route_all_dns() {
+    [[ -f "\$ROUTE_ALL_DNS_STATE" ]] || return 0
+    local service csv
+    IFS='|' read -r service csv < "\$ROUTE_ALL_DNS_STATE" || true
+    [[ -n "\$service" ]] || return 0
+    if [[ -z "\${csv:-}" ]]; then
+        set_service_dns_servers "\$service"
+    else
+        IFS=',' read -r -a prev_dns <<< "\$csv"
+        set_service_dns_servers "\$service" "\${prev_dns[@]}"
+    fi
+    rm -f "\$ROUTE_ALL_DNS_STATE"
+}
+
 # ── First pass: extract control-plane signals from peer list ──────────────
 WANT_ROUTE_ALL=0
 ROUTE_ALL_EP=""
@@ -274,7 +520,7 @@ if [[ "\$WANT_ROUTE_ALL" = "1" && "\$ON_SAME_LAN" = "0" && -n "\$ROUTE_ALL_EP" ]
     # trusted when we're on the host's LAN (hairpin NAT would break the
     # handshake) and the LAN already carries the traffic we care about.
     ENDPOINT_IP="\${ROUTE_ALL_EP%:*}"
-    read -r _ DEFAULT_GW < <(get_phys_default)
+    read -r DEFAULT_IFACE DEFAULT_GW < <(get_phys_default)
     if [[ -n "\$DEFAULT_GW" && -n "\$ENDPOINT_IP" ]]; then
         route -nq delete -host "\$ENDPOINT_IP" 2>/dev/null
         route -nq add -host "\$ENDPOINT_IP" "\$DEFAULT_GW" 2>/dev/null
@@ -283,6 +529,14 @@ if [[ "\$WANT_ROUTE_ALL" = "1" && "\$ON_SAME_LAN" = "0" && -n "\$ROUTE_ALL_EP" ]
     route -nq add    -net 0.0.0.0/1   -interface "\$WG_REAL" 2>/dev/null
     route -nq delete -net 128.0.0.0/1 2>/dev/null
     route -nq add    -net 128.0.0.0/1 -interface "\$WG_REAL" 2>/dev/null
+    if [[ "\$ROUTE_ALL_PREV" != on* && -n "\$DEFAULT_IFACE" ]]; then
+        PHYS_SERVICE="\$(get_network_service_for_iface "\$DEFAULT_IFACE")"
+        if [[ -n "\$PHYS_SERVICE" ]]; then
+            PREV_DNS="\$(get_current_dns_servers "\$PHYS_SERVICE" | paste -sd, -)"
+            echo "\${PHYS_SERVICE}|\${PREV_DNS}" > "\$ROUTE_ALL_DNS_STATE"
+            set_service_dns_servers "\$PHYS_SERVICE" 8.8.8.8 1.1.1.1
+        fi
+    fi
     echo "on|\${ENDPOINT_IP}" > "\$ROUTE_ALL_STATE"
 elif [[ "\$ROUTE_ALL_PREV" == on* ]]; then
     # Transition OUT: tear down /1 routes + endpoint exception
@@ -290,6 +544,7 @@ elif [[ "\$ROUTE_ALL_PREV" == on* ]]; then
     route -nq delete -net 128.0.0.0/1 2>/dev/null
     PREV_EP="\${ROUTE_ALL_PREV#*|}"
     [[ -n "\$PREV_EP" ]] && route -nq delete -host "\$PREV_EP" 2>/dev/null
+    restore_route_all_dns
     echo "off" > "\$ROUTE_ALL_STATE"
 fi
 
@@ -385,9 +640,19 @@ fi
 # This handles profile route policy changes (split→off, CIDR removal).
 
 INSTALLED_ROUTES_FILE="${KEY_DIR}/installed_routes"
+INSTALLED_ROUTES_IFACE_FILE="${KEY_DIR}/installed_routes_iface"
 PREV_ROUTES=""
+PREV_ROUTE_IFACE=\$(cat "\$INSTALLED_ROUTES_IFACE_FILE" 2>/dev/null || echo "")
 [[ -f "\$INSTALLED_ROUTES_FILE" ]] && PREV_ROUTES=\$(cat "\$INSTALLED_ROUTES_FILE")
 : > "\${INSTALLED_ROUTES_FILE}.new"
+
+if [[ -n "\$PREV_ROUTES" && -n "\$PREV_ROUTE_IFACE" && "\$PREV_ROUTE_IFACE" != "\$WG_REAL" ]]; then
+    echo "\$PREV_ROUTES" | while read -r old_cidr; do
+        [[ -z "\$old_cidr" ]] && continue
+        del_peer_route "\$old_cidr"
+    done
+    PREV_ROUTES=""
+fi
 
 echo "\$RESPONSE" | jq -c '.peers[]' 2>/dev/null | while read -r peer; do
     PUBKEY=\$(echo "\$peer" | jq -r '.public_key')
@@ -395,19 +660,31 @@ echo "\$RESPONSE" | jq -c '.peers[]' 2>/dev/null | while read -r peer; do
     EP=\$(echo "\$peer" | jq -r '.endpoint // empty')
     PEER_SAME_LAN=\$(echo "\$peer" | jq -r '.on_same_lan // false')
     if [[ -n "\$EP" ]]; then
-        wg set "\$WG_REAL" peer "\$PUBKEY" allowed-ips "\$ALLOWED" endpoint "\$EP" persistent-keepalive 25
+        "\$WG_BIN" set "\$WG_REAL" peer "\$PUBKEY" allowed-ips "\$ALLOWED" endpoint "\$EP" persistent-keepalive 25
     else
-        wg set "\$WG_REAL" peer "\$PUBKEY" allowed-ips "\$ALLOWED" persistent-keepalive 25
+        "\$WG_BIN" set "\$WG_REAL" peer "\$PUBKEY" allowed-ips "\$ALLOWED" persistent-keepalive 25
     fi
     [[ "\$PEER_SAME_LAN" == "true" ]] && continue
     echo "\$ALLOWED" | tr ',' '\\n' | tr -d ' ' | while read -r cidr; do
         [[ -z "\$cidr" || "\$cidr" == "0.0.0.0/0" ]] && continue
-        add_peer_route "\$cidr" "\$WG_REAL"
         echo "\$cidr" >> "\${INSTALLED_ROUTES_FILE}.new"
     done
 done
 
-# Remove stale routes: CIDRs in the old set but not in the new set.
+echo "\$RESPONSE" | jq -c '.probe_peers // []' > "${KEY_DIR}/probe_peers" 2>/dev/null || true
+
+# Shadow direct-probe peers: keep the direct path warm with endpoint +
+# keepalive only, but never let it own any routes until the brain
+# promotes it back to direct carrier ownership.
+echo "\$RESPONSE" | jq -c '.probe_peers[]?' 2>/dev/null | while read -r peer; do
+    PUBKEY=\$(echo "\$peer" | jq -r '.public_key // empty')
+    EP=\$(echo "\$peer" | jq -r '.endpoint // empty')
+    KEEPALIVE=\$(echo "\$peer" | jq -r '.persistent_keepalive // 25')
+    [[ -z "\$PUBKEY" || -z "\$EP" ]] && continue
+    "\$WG_BIN" set "\$WG_REAL" peer "\$PUBKEY" endpoint "\$EP" persistent-keepalive "\$KEEPALIVE"
+done
+
+# Reconcile kernel routes: add only newly-owned CIDRs, remove only stale ones.
 if [[ -s "\${INSTALLED_ROUTES_FILE}.new" ]]; then
     sort -u "\${INSTALLED_ROUTES_FILE}.new" > "\${INSTALLED_ROUTES_FILE}.sorted" 2>/dev/null || true
     if [[ -n "\$PREV_ROUTES" ]]; then
@@ -418,7 +695,14 @@ if [[ -s "\${INSTALLED_ROUTES_FILE}.new" ]]; then
             fi
         done
     fi
+    cat "\${INSTALLED_ROUTES_FILE}.sorted" | while read -r new_cidr; do
+        [[ -z "\$new_cidr" ]] && continue
+        if ! echo "\$PREV_ROUTES" | grep -qxF "\$new_cidr" 2>/dev/null; then
+            add_peer_route "\$new_cidr" "\$WG_REAL"
+        fi
+    done
     mv -f "\${INSTALLED_ROUTES_FILE}.sorted" "\$INSTALLED_ROUTES_FILE" 2>/dev/null || true
+    printf '%s' "\$WG_REAL" > "\$INSTALLED_ROUTES_IFACE_FILE"
     rm -f "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
 else
     # No routes installed this cycle — remove all previously tracked.
@@ -428,22 +712,60 @@ else
             del_peer_route "\$old_cidr"
         done
     fi
-    rm -f "\$INSTALLED_ROUTES_FILE" "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
+    rm -f "\$INSTALLED_ROUTES_FILE" "\$INSTALLED_ROUTES_IFACE_FILE" "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
 fi
 
 # ── Remove stale WireGuard peers ──────────────────────────────────────────
 # If the brain stopped advertising a peer (e.g., native-LAN host-routed
 # mode), remove it from WireGuard's crypto-key routing table.
-RESPONSE_PUBKEYS=\$(echo "\$RESPONSE" | jq -r '.peers[].public_key' 2>/dev/null | sort -u)
-WG_PUBKEYS=\$(wg show "\$WG_REAL" peers 2>/dev/null | sort -u)
+RESPONSE_PUBKEYS=\$(
+    echo "\$RESPONSE" \
+        | jq -r '[(.peers[]?.public_key), (.probe_peers[]?.public_key)] | map(select(. != null and . != "")) | .[]' 2>/dev/null \
+        | sort -u
+)
+WG_PUBKEYS=\$("\$WG_BIN" show "\$WG_REAL" peers 2>/dev/null | sort -u)
 if [[ -n "\$WG_PUBKEYS" ]]; then
     echo "\$WG_PUBKEYS" | while read -r wg_pk; do
         [[ -z "\$wg_pk" ]] && continue
         if ! echo "\$RESPONSE_PUBKEYS" | grep -qxF "\$wg_pk"; then
-            wg set "\$WG_REAL" peer "\$wg_pk" remove 2>/dev/null || true
+            "\$WG_BIN" set "\$WG_REAL" peer "\$wg_pk" remove 2>/dev/null || true
         fi
     done
 fi
+
+# ── Multi-membership heartbeat pass (attached networks wg1+) ─────────────────
+# Attached memberships share the primary's device_secret (same hash on
+# the brain side). Minimal v1 heartbeat per attached iface so the brain
+# keeps them online + tracks per-iface tx/rx. Host-mode state machines
+# above stay primary-only.
+ATTACHED_CAPABILITIES_JSON=\$(current_capabilities_json)
+shopt -s nullglob
+for att_dir in /etc/wireguard/wg* ; do
+    [[ -d "\$att_dir" ]] || continue
+    att_iface=\$(basename "\$att_dir")
+    [[ "\$att_iface" == "${WG_IFACE}" ]] && continue
+    att_node_id=\$(cat "\$att_dir/node_id" 2>/dev/null || true)
+    att_brain=\$(cat "\$att_dir/brain_url" 2>/dev/null || true)
+    [[ -z "\$att_node_id" || -z "\$att_brain" ]] && continue
+    # macOS utun devices aren't enumerable by iface name; rely on
+    # wg show knowing them as the conf alias.
+    att_transfer=\$("\$WG_BIN" show "\$att_iface" transfer 2>/dev/null)
+    [[ -z "\$att_transfer" ]] && continue
+    att_tx=\$(echo "\$att_transfer" | awk '{sum += \$3} END {print sum+0}')
+    att_rx=\$(echo "\$att_transfer" | awk '{sum += \$2} END {print sum+0}')
+    att_payload=\$(jq -cn \\
+        --argjson tx_bytes "\$att_tx" \\
+        --argjson rx_bytes "\$att_rx" \\
+        --argjson installation_id "\$INSTALLATION_ID_JSON" \\
+        --argjson capabilities "\$ATTACHED_CAPABILITIES_JSON" \\
+        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities}')
+    ATT_HEADERS=( -H "Content-Type: application/json" )
+    [[ -n "\$DEVICE_SECRET" ]] && ATT_HEADERS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
+    curl -sf -X POST "\${ATT_HEADERS[@]}" \\
+        -d "\$att_payload" \\
+        "\${att_brain%/}/api/v1/nodes/\${att_node_id}/heartbeat" \\
+        >/dev/null 2>&1 || true
+done
 HBSCRIPT
     chmod +x "$HEARTBEAT_SCRIPT"
 }
@@ -451,12 +773,28 @@ HBSCRIPT
 # ── Subcommand dispatch ───────────────────────────────────────────────────────
 SUBCMD="${1:-}"
 
-if [[ "$SUBCMD" != "enroll" && "$SUBCMD" != "unenroll" && "$SUBCMD" != "update" && "$SUBCMD" != "rotate-secret" ]]; then
+# Multi-membership subcommands (M2 roadmap, 2026-04-20). Mirrors
+# connector.sh — see docs/CONNECTOR_MULTINETWORK_ROADMAP.md.
+KNOWN_SUBCMDS=( enroll unenroll update rotate-secret attach detach list-networks )
+
+is_known_subcmd() {
+    local candidate="$1"
+    local known
+    for known in "${KNOWN_SUBCMDS[@]}"; do
+        [[ "$candidate" == "$known" ]] && return 0
+    done
+    return 1
+}
+
+if ! is_known_subcmd "$SUBCMD"; then
     echo "Usage:"
-    echo "  $0 enroll       <TOKEN> <BRAIN_URL> [NODE_NAME] [ROLE]"
-    echo "  $0 update       <NEW_BRAIN_URL>"
-    echo "  $0 unenroll     [BRAIN_URL]"
+    echo "  $0 enroll        <TOKEN> <BRAIN_URL> [NODE_NAME] [ROLE]"
+    echo "  $0 update        <NEW_BRAIN_URL>"
+    echo "  $0 unenroll      [BRAIN_URL]"
     echo "  $0 rotate-secret [BRAIN_URL]"
+    echo "  $0 attach        <NETWORK_ID> <PAT> [BRAIN_URL] [ROLE] [NAME] [ROUTES_CSV]"
+    echo "  $0 detach        <INTERFACE|NODE_ID|NETWORK_ID> <PAT>"
+    echo "  $0 list-networks"
     exit 1
 fi
 
@@ -482,6 +820,22 @@ elif [[ "$SUBCMD" == "rotate-secret" ]]; then
         done
     fi
     [[ -n "$BRAIN_URL" ]] || { echo "Usage: $0 rotate-secret [BRAIN_URL]"; exit 1; }
+elif [[ "$SUBCMD" == "list-networks" ]]; then
+    :  # no args
+elif [[ "$SUBCMD" == "attach" ]]; then
+    ATTACH_NETWORK_ID="${1:-}"
+    ATTACH_PAT="${2:-}"
+    ATTACH_BRAIN_URL="${3:-}"
+    ATTACH_ROLE="${4:-client}"
+    ATTACH_NODE_NAME="${5:-$(hostname -s)}"
+    ATTACH_ROUTES_CSV="${6:-}"
+    [[ -n "$ATTACH_NETWORK_ID" && -n "$ATTACH_PAT" ]] \
+        || { echo "Usage: $0 attach <NETWORK_ID> <PAT> [BRAIN_URL] [ROLE] [NAME] [ROUTES_CSV]"; exit 1; }
+elif [[ "$SUBCMD" == "detach" ]]; then
+    DETACH_TARGET="${1:-}"
+    DETACH_PAT="${2:-}"
+    [[ -n "$DETACH_TARGET" && -n "$DETACH_PAT" ]] \
+        || { echo "Usage: $0 detach <INTERFACE|NODE_ID|NETWORK_ID> <PAT>"; exit 1; }
 else
     TOKEN="${1:-}"
     BRAIN_URL="${2:-}"
@@ -504,8 +858,13 @@ if [[ "$SUBCMD" == "rotate-secret" ]]; then
     CUR_SECRET=$(cat "$DEVICE_SECRET_FILE" 2>/dev/null || true)
     ROTATE_ARGS=( -sf -X POST -H "Content-Type: application/json" )
     [[ -n "$CUR_SECRET" ]] && ROTATE_ARGS+=( -H "X-Device-Secret: $CUR_SECRET" )
-    RESP=$(curl "${ROTATE_ARGS[@]}" "${BRAIN_URL}/api/v1/nodes/${NODE_ID}/rotate-secret" -d '{}') \
-        || die "rotate-secret request failed — brain unreachable or current secret rejected."
+    RESP=$(curl "${ROTATE_ARGS[@]}" "${BRAIN_URL}/api/v1/nodes/${NODE_ID}/rotate-secret" -d '{}' 2>/dev/null || true)
+    if [[ -z "$RESP" ]]; then
+        warn "rotate-secret with current secret failed; retrying legacy recovery path"
+        RESP=$(curl -sf -X POST -H "Content-Type: application/json" \
+            "${BRAIN_URL}/api/v1/nodes/${NODE_ID}/rotate-secret" -d '{}' 2>/dev/null) \
+            || die "rotate-secret request failed — brain unreachable or recovery path rejected."
+    fi
 
     NEW_SECRET=$(echo "$RESP" | jq -r '.device_secret // empty')
     [[ -n "$NEW_SECRET" ]] || die "Brain returned no device_secret in rotate response: $RESP"
@@ -516,6 +875,176 @@ if [[ "$SUBCMD" == "rotate-secret" ]]; then
     mv -f "$TMP_SECRET" "$DEVICE_SECRET_FILE"
 
     log "Device secret rotated successfully. Future heartbeats will use the new secret."
+    exit 0
+fi
+
+# ── LIST-NETWORKS ─────────────────────────────────────────────────────────────
+# List every membership held by this macOS installation (primary wg0 and
+# any attached wgN). Same shape as connector.sh list-networks.
+if [[ "$SUBCMD" == "list-networks" ]]; then
+    printf '%-10s %-38s %-20s %s\n' "IFACE" "NODE_ID" "OVERLAY_IP" "BRAIN_URL"
+    printf '%-10s %-38s %-20s %s\n' "-----" "-------" "----------" "---------"
+    shopt -s nullglob
+    for dir in /etc/wireguard/wg* ; do
+        [[ -d "$dir" ]] || continue
+        iface=$(basename "$dir")
+        nid=$(cat "${dir}/node_id" 2>/dev/null || true)
+        oip=$(cat "${dir}/overlay_ip" 2>/dev/null || true)
+        burl=$(cat "${dir}/brain_url" 2>/dev/null || true)
+        [[ -z "$nid" ]] && continue
+        printf '%-10s %-38s %-20s %s\n' "$iface" "${nid:-?}" "${oip:--}" "${burl:--}"
+    done
+    exit 0
+fi
+
+# ── ATTACH ────────────────────────────────────────────────────────────────────
+# Attach this installation to an ADDITIONAL network. See connector.sh's
+# ATTACH section for the full protocol narrative — this mirror uses the
+# same endpoints and state layout. The macOS-specific bit is launchd
+# instead of systemd for keeping wg-quick@wgN alive across reboots.
+if [[ "$SUBCMD" == "attach" ]]; then
+    [[ -f "$DEVICE_ID_FILE" ]] \
+        || die "Primary wg0 isn't enrolled yet. Run '$0 enroll ...' first."
+    DEVICE_ID=$(cat "$DEVICE_ID_FILE")
+    DEVICE_SECRET=$(cat "$DEVICE_SECRET_FILE" 2>/dev/null || true)
+    [[ -n "$DEVICE_SECRET" ]] || die "Missing device_secret — run '$0 rotate-secret' first."
+
+    if [[ -z "$ATTACH_BRAIN_URL" ]]; then
+        ATTACH_BRAIN_URL=$(cat /etc/wireguard/wg0/brain_url 2>/dev/null || true)
+    fi
+    [[ -n "$ATTACH_BRAIN_URL" ]] || die "Could not determine brain URL. Pass it as the third arg."
+    ATTACH_BRAIN_URL="${ATTACH_BRAIN_URL%/}"
+
+    next_iface=""
+    for n in {1..63}; do
+        candidate="wg${n}"
+        if [[ ! -e "/etc/wireguard/${candidate}.conf" && ! -d "/etc/wireguard/${candidate}" ]]; then
+            next_iface="$candidate"
+            break
+        fi
+    done
+    [[ -n "$next_iface" ]] || die "No free wg interface names between wg1 and wg63."
+    ATTACH_DIR="/etc/wireguard/${next_iface}"
+    mkdir -p "$ATTACH_DIR"
+    chmod 700 "$ATTACH_DIR"
+
+    log "Attaching network ${ATTACH_NETWORK_ID} on ${next_iface} (brain=${ATTACH_BRAIN_URL})..."
+
+    wg genkey | tee "${ATTACH_DIR}/private.key" | wg pubkey > "${ATTACH_DIR}/public.key"
+    chmod 600 "${ATTACH_DIR}/private.key"
+    ATTACH_PRIV=$(cat "${ATTACH_DIR}/private.key")
+    ATTACH_PUB=$(cat "${ATTACH_DIR}/public.key")
+
+    REQ_BODY=$(jq -cn \
+        --arg network_id "$ATTACH_NETWORK_ID" \
+        --arg desired_role "$ATTACH_ROLE" \
+        --arg desired_name "$ATTACH_NODE_NAME" \
+        '{network_id:$network_id, desired_role:$desired_role, desired_name:$desired_name}')
+    CREATE_RESP=$(curl -sf -X POST \
+        -H "Authorization: Bearer ${ATTACH_PAT}" \
+        -H "Content-Type: application/json" \
+        -d "$REQ_BODY" \
+        "${ATTACH_BRAIN_URL}/api/v1/devices/${DEVICE_ID}/memberships") \
+        || { rm -rf "$ATTACH_DIR"; die "Attach request failed. Check PAT + NETWORK_ID + that the brain has seen this device advertise multi_membership_v1."; }
+
+    REQ_ID=$(echo "$CREATE_RESP" | jq -r --arg nid "$ATTACH_NETWORK_ID" '
+        (.pending_membership_requests // [])
+        | map(select(.network_id == $nid and .status == "pending"))
+        | sort_by(.created_at) | last | .id // empty')
+    [[ -n "$REQ_ID" ]] || { rm -rf "$ATTACH_DIR"; die "Brain did not return a pending membership request id: $CREATE_RESP"; }
+
+    ATTACH_PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+    ATTACH_ENDPOINT=""
+    [[ -n "$ATTACH_PUBLIC_IP" ]] && ATTACH_ENDPOINT="${ATTACH_PUBLIC_IP}:51820"
+    if [[ -n "$ATTACH_ROUTES_CSV" ]]; then
+        ATTACH_ROUTES_JSON=$(echo "$ATTACH_ROUTES_CSV" | jq -R 'split(",") | map(select(length > 0) | gsub("^ +| +$"; ""))')
+    else
+        ATTACH_ROUTES_JSON="[]"
+    fi
+    FULFILL_BODY=$(jq -cn \
+        --arg public_key "$ATTACH_PUB" \
+        --arg node_name "$ATTACH_NODE_NAME" \
+        --arg os_type "macos" \
+        --arg endpoint "$ATTACH_ENDPOINT" \
+        --argjson advertised_routes "$ATTACH_ROUTES_JSON" \
+        '{public_key:$public_key, node_name:$node_name, os_type:$os_type, endpoint:($endpoint|select(length>0)), advertised_routes:$advertised_routes}')
+
+    FULFILL_RESP=$(curl -sf -X POST \
+        -H "X-Device-Secret: ${DEVICE_SECRET}" \
+        -H "Wg0-Protocol-Version: 2" \
+        -H "Content-Type: application/json" \
+        -d "$FULFILL_BODY" \
+        "${ATTACH_BRAIN_URL}/api/v2/installations/${DEVICE_ID}/memberships/${REQ_ID}/fulfill") \
+        || { rm -rf "$ATTACH_DIR"; die "Fulfillment failed. The pending request still exists brain-side — retry or delete it from the dashboard."; }
+
+    ATTACH_NODE_ID=$(echo "$FULFILL_RESP" | jq -r '.node_id')
+    ATTACH_OVERLAY=$(echo "$FULFILL_RESP" | jq -r '.overlay_ip')
+    ATTACH_WG_CONFIG=$(echo "$FULFILL_RESP" | jq -r '.wg_config')
+    [[ -n "$ATTACH_NODE_ID" && "$ATTACH_NODE_ID" != "null" ]] \
+        || { rm -rf "$ATTACH_DIR"; die "Fulfillment response missing node_id: $FULFILL_RESP"; }
+
+    echo "$ATTACH_NODE_ID"      > "${ATTACH_DIR}/node_id";     chmod 600 "${ATTACH_DIR}/node_id"
+    echo "$ATTACH_NETWORK_ID"   > "${ATTACH_DIR}/network_id";  chmod 600 "${ATTACH_DIR}/network_id"
+    echo "$ATTACH_BRAIN_URL"    > "${ATTACH_DIR}/brain_url";   chmod 600 "${ATTACH_DIR}/brain_url"
+    echo "${ATTACH_OVERLAY%/*}" > "${ATTACH_DIR}/overlay_ip";  chmod 600 "${ATTACH_DIR}/overlay_ip"
+
+    ATTACH_CONF="/etc/wireguard/${next_iface}.conf"
+    echo "$ATTACH_WG_CONFIG" \
+        | sed "s|# PrivateKey = <CONNECTOR_FILLS_THIS_IN>|PrivateKey = ${ATTACH_PRIV}|" \
+        > "$ATTACH_CONF"
+    chmod 600 "$ATTACH_CONF"
+
+    # Bring the tunnel up. macOS uses wg-quick directly (via brew
+    # wireguard-tools); reboot-persistence is handled by a launchd plist
+    # that parallels the macOS primary path — documented in the macOS
+    # diagnostics plan.
+    wg-quick up "$ATTACH_CONF" || die "wg-quick up ${ATTACH_CONF} failed."
+
+    log "Attached! ${next_iface} → ${ATTACH_OVERLAY} (node_id=${ATTACH_NODE_ID})"
+    log "Note: heartbeats for attached memberships need the per-interface timer (coming in a follow-up)."
+    exit 0
+fi
+
+# ── DETACH ────────────────────────────────────────────────────────────────────
+if [[ "$SUBCMD" == "detach" ]]; then
+    det_iface=""
+    if [[ -d "/etc/wireguard/${DETACH_TARGET}" ]]; then
+        det_iface="$DETACH_TARGET"
+    else
+        shopt -s nullglob
+        for dir in /etc/wireguard/wg* ; do
+            [[ -d "$dir" ]] || continue
+            it=$(basename "$dir")
+            [[ "$it" == "wg0" ]] && continue
+            if [[ "$(cat "${dir}/node_id" 2>/dev/null || true)" == "$DETACH_TARGET" ]] \
+                || [[ "$(cat "${dir}/network_id" 2>/dev/null || true)" == "$DETACH_TARGET" ]]; then
+                det_iface="$it"
+                break
+            fi
+        done
+    fi
+    [[ -n "$det_iface" ]] || die "Could not resolve '${DETACH_TARGET}' to an attached membership. Run '$0 list-networks' to inspect state."
+    [[ "$det_iface" == "wg0" ]] && die "wg0 is the primary installation. Use '$0 unenroll' to remove it."
+
+    det_dir="/etc/wireguard/${det_iface}"
+    det_node_id=$(cat "${det_dir}/node_id" 2>/dev/null || true)
+    det_brain=$(cat "${det_dir}/brain_url" 2>/dev/null || cat /etc/wireguard/wg0/brain_url 2>/dev/null || true)
+    det_device_id=$(cat "$DEVICE_ID_FILE" 2>/dev/null || true)
+
+    if [[ -n "$det_node_id" && -n "$det_brain" && -n "$det_device_id" ]]; then
+        curl -sf -X DELETE \
+            -H "Authorization: Bearer ${DETACH_PAT}" \
+            "${det_brain%/}/api/v1/devices/${det_device_id}/memberships/${det_node_id}" \
+            >/dev/null 2>&1 || warn "Brain-side detach failed; continuing with local teardown."
+    fi
+
+    if ifconfig "$det_iface" >/dev/null 2>&1; then
+        wg-quick down "/etc/wireguard/${det_iface}.conf" 2>/dev/null || true
+    fi
+    rm -f "/etc/wireguard/${det_iface}.conf"
+    rm -rf "${det_dir}"
+
+    log "Detached ${det_iface} (node_id=${det_node_id:-unknown})."
     exit 0
 fi
 
@@ -542,6 +1071,17 @@ if [[ "$SUBCMD" == "update" ]]; then
     # ── 2. Store brain URL for future reference ──────────────────────────────
     echo "$BRAIN_URL" > "${KEY_DIR}/brain_url"
     chmod 600 "${KEY_DIR}/brain_url"
+
+    # Propagate the new brain URL to any attached memberships too
+    # (wg1/, wg2/, ...) so `update` rehomes the whole installation.
+    shopt -s nullglob
+    for att_dir in /etc/wireguard/wg* ; do
+        [[ -d "$att_dir" ]] || continue
+        [[ "$(basename "$att_dir")" == "wg0" ]] && continue
+        [[ -f "$att_dir/brain_url" ]] || continue
+        echo "$BRAIN_URL" > "$att_dir/brain_url"
+        chmod 600 "$att_dir/brain_url"
+    done
 
     # ── 3. Migrate legacy heartbeat script name ──────────────────────────────
     OLD_HB="/usr/local/bin/abslink-heartbeat"
@@ -610,7 +1150,7 @@ if [[ "$SUBCMD" == "update" ]]; then
 
     # ── 8. Force an immediate heartbeat to verify ────────────────────────────
     log "Running heartbeat to verify connectivity..."
-    if bash "$HEARTBEAT_SCRIPT" 2>/dev/null; then
+    if WG0_HEARTBEAT_STRICT=1 bash "$HEARTBEAT_SCRIPT" 2>/dev/null; then
         log "Heartbeat succeeded — connected to ${BRAIN_URL}"
     else
         warn "Heartbeat failed — check that ${BRAIN_URL} is reachable"
@@ -730,6 +1270,7 @@ if [[ ! -f "$PRIV_KEY_FILE" ]]; then
 fi
 PRIV_KEY=$(cat "$PRIV_KEY_FILE")
 PUB_KEY=$(cat "$PUB_KEY_FILE")
+INSTALLATION_ID=$(get_or_create_installation_id)
 log "Public key: ${PUB_KEY}"
 
 # ── Detect public endpoint ────────────────────────────────────────────────────
@@ -744,6 +1285,7 @@ if [[ ! -f "$NODE_ID_FILE" ]]; then
     PAYLOAD=$(cat <<EOF
 {
     "token": "${TOKEN}",
+    "installation_id": "${INSTALLATION_ID}",
     "public_key": "${PUB_KEY}",
     "node_name": "${NODE_NAME}",
     "os_type": "macos",
@@ -760,6 +1302,7 @@ EOF
         "${BRAIN_URL}/api/v1/enroll/register") \
         || die "Enrollment failed. Check TOKEN and BRAIN_URL."
 
+    DEVICE_ID=$(echo "$ENROLL_RESPONSE" | jq -r '.device_id // empty')
     NODE_ID=$(echo "$ENROLL_RESPONSE" | jq -r '.node_id')
     OVERLAY_IP=$(echo "$ENROLL_RESPONSE" | jq -r '.overlay_ip')
     WG_CONFIG=$(echo "$ENROLL_RESPONSE" | jq -r '.wg_config')
@@ -769,6 +1312,10 @@ EOF
 
     echo "$NODE_ID" > "$NODE_ID_FILE"
     chmod 600 "$NODE_ID_FILE"
+    if [[ -n "$DEVICE_ID" ]]; then
+        printf '%s' "$DEVICE_ID" > "$DEVICE_ID_FILE"
+        chmod 600 "$DEVICE_ID_FILE"
+    fi
     echo "$BRAIN_URL" > "${KEY_DIR}/brain_url"
     chmod 600 "${KEY_DIR}/brain_url"
     if [[ -n "$DEVICE_SECRET" ]]; then
@@ -925,7 +1472,7 @@ cat > "$WG_WATCHDOG_PLIST" <<WGPLIST
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>export PATH="${BREW_PREFIX}/bin:${BREW_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin"; WG_REAL=\$(cat /var/run/wireguard/${WG_IFACE}.name 2>/dev/null | tr -d '[:space:]'); { [[ -n "\$WG_REAL" ]] &amp;&amp; wg show "\$WG_REAL" &gt;/dev/null 2&gt;&amp;1; } || { rm -f /var/run/wireguard/${WG_IFACE}.sock /var/run/wireguard/${WG_IFACE}.name; wg-quick up ${WG_CONF}; }</string>
+        <string>export PATH="${BREW_PREFIX}/bin:${BREW_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin"; WG_BIN=""; for p in "${BREW_PREFIX}/bin/wg" "/usr/local/bin/wg" "/usr/bin/wg"; do [[ -x "\$p" ]] &amp;&amp; { WG_BIN="\$p"; break; }; done; [[ -z "\$WG_BIN" ]] &amp;&amp; WG_BIN="wg"; WG_REAL=\$(cat /var/run/wireguard/${WG_IFACE}.name 2>/dev/null | tr -d '[:space:]'); [[ -z "\$WG_REAL" ]] &amp;&amp; WG_REAL=\$("\$WG_BIN" show interfaces 2&gt;/dev/null | awk '{print \$1}'); { [[ -n "\$WG_REAL" ]] &amp;&amp; "\$WG_BIN" show "\$WG_REAL" &gt;/dev/null 2&gt;&amp;1; } || { rm -f /var/run/wireguard/${WG_IFACE}.sock /var/run/wireguard/${WG_IFACE}.name; wg-quick up ${WG_CONF}; }</string>
     </array>
     <key>StartInterval</key>
     <integer>60</integer>

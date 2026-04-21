@@ -1,9 +1,9 @@
 # wg0 MCP server — install, configure, verify
 
 **Status:** shipped + smoke-tested end-to-end in prod
-**Last revised:** 2026-04-10
+**Last revised:** 2026-04-17 (remote/OAuth variant added)
 **Owner:** Scott
-**Source:** [mcp/](../mcp/) (TypeScript stdio server on `@modelcontextprotocol/sdk`)
+**Source:** [mcp/](../mcp/) (TypeScript stdio + Streamable HTTP server on `@modelcontextprotocol/sdk`)
 
 This is the single source of truth for how to use the wg0 MCP
 server from Claude Desktop, Claude Code, Cursor, or any other
@@ -13,12 +13,27 @@ in the repo points at.
 
 ## What the MCP server is
 
-A stdio-transported Model Context Protocol server that wraps the
-wg0 brain's REST API as tools an LLM can call directly. Once
-configured in an agent host, the agent can operate your wg0
-control plane conversationally: list networks, provision devices,
-toggle route-all, activate BYO Exit upstreams, investigate
-roaming, and audit presence.
+A Model Context Protocol server that wraps the wg0 brain's REST API
+as tools an LLM can call directly. Once configured in an agent host,
+the agent can operate your wg0 control plane conversationally: list
+networks, provision devices, toggle route-all, activate BYO Exit
+upstreams, investigate roaming, and audit presence.
+
+The server ships two interchangeable transports:
+
+- **Remote (Streamable HTTP)** at `https://mcp.wg0.io/mcp`. This is
+  the one you want if your agent host has a "paste a URL" dialog —
+  Claude Desktop's *Settings → Connectors → Add custom connector*,
+  for example. Authentication goes through OAuth 2.1 with Dynamic
+  Client Registration, so the user just pastes the URL, clicks
+  through a login + approve page in the browser, and the agent
+  walks away with a short-lived bearer token. No PAT copy-paste.
+- **Local (stdio)**. The agent host spawns `node dist/index.js` as a
+  subprocess and talks JSON-RPC over pipes. Uses `WG0_API_KEY`
+  (a PAT) in its env. Best for Claude Code, CI, and anyone who'd
+  rather configure a JSON file than use a GUI.
+
+Both transports share the same 16 tools, 3 resources, and 4 prompts.
 
 The server exposes three kinds of MCP objects:
 
@@ -44,8 +59,8 @@ The server exposes three kinds of MCP objects:
 ## Step 1 — build the MCP server
 
 ```bash
-git clone https://github.com/absginc/ABSLINK-brain
-cd ABSLINK-brain/mcp
+git clone https://github.com/absginc/wg0
+cd wg0/mcp
 npm install
 npm run build
 ```
@@ -55,9 +70,9 @@ host's config will point at this file.
 
 ```bash
 pwd
-# e.g. /Users/scott/code/ABSLINK-brain/mcp
+# e.g. /Users/scott/code/wg0/mcp
 # The absolute path to dist/index.js is:
-# /Users/scott/code/ABSLINK-brain/mcp/dist/index.js
+# /Users/scott/code/wg0/mcp/dist/index.js
 ```
 
 ## Step 2 — mint a PAT
@@ -125,7 +140,50 @@ you lose the plaintext you have to revoke and mint a new one.
 
 ## Step 3 — configure your agent host
 
-### Claude Desktop (macOS)
+### Claude Desktop — remote (URL dialog, no PAT copy-paste)
+
+**This is the recommended path** if your Claude Desktop version
+shows a "Connectors" screen in Settings.
+
+1. Open **Settings → Connectors → Add custom connector**.
+2. Paste `https://mcp.wg0.io/mcp` into the URL field and submit.
+3. Claude Desktop fetches `/.well-known/oauth-protected-resource` on
+   the MCP host, follows the pointer to the brain's OAuth metadata
+   at `https://connect.wg0.io/.well-known/oauth-authorization-server`,
+   and auto-registers itself as an OAuth client (RFC 7591). You do
+   not see any of this.
+4. A browser tab opens at `https://login.wg0.io/oauth/consent?...`.
+   If you're not signed in, sign in with your wg0 email + password;
+   you'll be bounced back to the consent page automatically.
+5. Review the "Authorize <client> to access your wg0 account" card
+   and click **Allow**. Claude Desktop is handed a short-lived
+   bearer token and you're done — the connector shows as active.
+
+Access tokens are valid for 1 hour and Claude Desktop refreshes
+them in the background using a rotating refresh token (30-day TTL).
+You can revoke the connector at any time from the API Keys page in
+the dashboard — revocation is instant.
+
+The remote MCP server honors refreshed OAuth bearer tokens inside an
+already-open MCP session, so normal token rotation should not force a
+manual reconnect every hour. If the connector does need to be added
+again, treat that as a refresh-token or connector-state problem, not
+normal expected behavior.
+
+If the connector shows a token error:
+
+- `Access token expired` usually means the client did not refresh its
+  short-lived bearer successfully. Reconnect the connector once.
+- `Invalid access token` usually means the token is malformed, revoked,
+  or the connector has stale auth state and should be re-authorized.
+
+### Claude Desktop — local (stdio, config file)
+
+Keep using this if your agent host doesn't speak remote MCP yet, or
+if you want to run everything on the same machine with a PAT you
+control explicitly.
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -135,7 +193,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
     "wg0": {
       "command": "node",
       "args": [
-        "/Users/scott/code/ABSLINK-brain/mcp/dist/index.js"
+        "/Users/scott/code/wg0/mcp/dist/index.js"
       ],
       "env": {
         "WG0_BRAIN_URL": "https://connect.wg0.io",
@@ -170,7 +228,7 @@ shape is the same as Claude Desktop:
   "mcpServers": {
     "wg0": {
       "command": "node",
-      "args": ["/abs/path/to/ABSLINK-brain/mcp/dist/index.js"],
+      "args": ["/abs/path/to/wg0/mcp/dist/index.js"],
       "env": {
         "WG0_BRAIN_URL": "https://connect.wg0.io",
         "WG0_API_KEY": "wg0_pat_PASTE_FROM_STEP_2"
@@ -197,7 +255,7 @@ If you prefer containerization, a Dockerfile is in [mcp/Dockerfile](../mcp/Docke
 Build it once:
 
 ```bash
-cd ABSLINK-brain/mcp
+cd wg0/mcp
 docker build -t wg0/mcp-server:latest .
 ```
 
@@ -246,7 +304,15 @@ you own with `node_count` + `online_count` (online_count follows
 the four-state presence model — Online + Observed both count as
 up).
 
-## Tool list (16 tools)
+## Tool list
+
+The shipped server exposes tools across these families. Counts reflect
+the state of `mcp/src/tools/*.ts` after the shared-networks + devices +
+site-access additions; if the agent host shows a different number on
+`tools/list`, the build is out of sync — rebuild `mcp/` and restart
+the host.
+
+### Networks + nodes
 
 | Tool | Purpose |
 |---|---|
@@ -257,8 +323,54 @@ up).
 | `list_nodes` | Per-node `presence`, `observed_endpoint`, `last_activity`, `device_kind`, `route_all_active`, `on_host_lan`. Optional `network_id` filter. |
 | `update_node` | Rename, toggle `route_all_traffic`, set/clear `current_upstream_exit_id`. |
 | `delete_node` | Remove a node, unregister from discover sidecar. |
+
+### Managed devices (multi-network)
+
+| Tool | Purpose |
+|---|---|
+| `list_devices` | Every managed device with its memberships, telemetry, and installation id. |
+| `get_device` | Single device detail including all active memberships. |
+| `get_device_endpoint_history` | Roaming history for the device as a whole, not a single membership. |
+| `get_device_peerings` | Relay / direct-peer status per membership. |
+| `update_device` | Rename, toggle `collect_device_telemetry`, etc. |
+| `delete_device` | Destructive — removes the device and all its memberships. |
+| `preflight_device_attach` | Check route conflicts + capability gates before attaching. |
+| `attach_device_to_network` | Request + fulfill an attach to a second network owned by this account. |
+| `update_device_membership` | Per-membership patch (route-all, name, advertised_routes). |
+| `remove_device_membership` | Detach from one network; device stays alive + other memberships untouched. |
 | `provision_device` | Server-side keygen + enroll for the mobile/QR flow. Returns full `wg_config` with `PrivateKey` populated. |
 | `generate_enrollment_token` | Mint a token for the bring-your-own-key enrollment path (shell connector). |
+
+### Shared networks (cross-account)
+
+| Tool | Purpose |
+|---|---|
+| `list_shared_network_access` | Shared networks the caller is a member of. |
+| `create_shared_network_invite` | Owner/admin mints an email invite (7-day expiry). |
+| `revoke_shared_network_invite` | Pull a pending invite before it's accepted. |
+| `revoke_shared_network_member` | Remove a guest from the shared network. |
+| `revoke_shared_network_device` | Detach one of the guest's devices without removing the membership. |
+| `generate_shared_network_enrollment_token` | Guest mints a single-use enrollment token scoped to the shared network. |
+| `preflight_shared_network_attach` | Preflight the attach against the guest's active device memberships. |
+| `attach_device_to_shared_network` | Attach an existing device to a shared network (instead of enrolling fresh). |
+
+### Site access (gateway exports + access grants)
+
+| Tool | Purpose |
+|---|---|
+| `list_gateway_exports` | Gateway-exported routes per host node. |
+| `create_gateway_export` | Advertise specific LAN subnets from a host into a hub_spoke access network. |
+| `update_gateway_export` | Toggle active flag, rename, change exported_routes. |
+| `delete_gateway_export` | Remove an export. |
+| `list_access_grants` | Subjects (user / device_profile / device) with access to each export. |
+| `create_access_grant` | Bind a subject to a gateway export. |
+| `update_access_grant` | Toggle active / re-scope. |
+| `delete_access_grant` | Hard-remove a grant. |
+
+### BYO Exit + traffic
+
+| Tool | Purpose |
+|---|---|
 | `list_upstream_exits` | BYO Exit inventory per host. `wg_config` excluded for safety. |
 | `create_upstream_exit` | Upload a provider wg-config (Mullvad, Proton, Azire, custom). |
 | `delete_upstream_exit` | Remove an upstream permanently. |
@@ -354,7 +466,7 @@ You can speak MCP JSON-RPC to the compiled binary manually for a
 smoke test:
 
 ```bash
-cd ABSLINK-brain/mcp
+cd wg0/mcp
 # Replace with your real PAT
 export WG0_API_KEY=wg0_pat_...
 export WG0_BRAIN_URL=https://connect.wg0.io
@@ -398,7 +510,7 @@ banner on stderr.
 ### Rebuilding after source changes
 
 ```bash
-cd ABSLINK-brain/mcp
+cd wg0/mcp
 npm run build        # one-shot
 npm run dev          # tsc --watch, rebuild on every save
 ```

@@ -1,60 +1,115 @@
 # wg0
 
-> Software-defined private networking control plane for WireGuard. Multi-tenant, self-hostable, native-LAN capable, BYO-exit aware. Built for homes, offices, and small distributed teams that need private-network access and gateway behavior without a full SASE stack.
+> Device-first WireGuard control plane for private networks, native-LAN placement, host-based VPN egress, relay-assisted peer recovery, and managed connector orchestration.
 
-wg0 (formerly ABS-LINK) runs a Rust brain + a set of shell connectors + a React dashboard + a WireGuard-go-based discover sidecar for NAT traversal. It is not a cloud relay and does not ship identity posture or browser access. It sits between consumer/prosumer remote-access VPN products and full SASE/SD-WAN platforms.
+wg0 (formerly ABS-LINK) runs a Rust brain, managed Linux/macOS/Docker connectors, a React dashboard, a discover sidecar, and dedicated per-account relay infrastructure for eligible plans.
 
 Authenticated surfaces:
 
-- JWT for human-owner operations (dashboard + short-lived automation)
-- Personal Access Tokens (`Authorization: Bearer wg0_pat_...`) for
-  long-lived automation, MSP tooling, and MCP integrations. PATs are
-  minted via `POST /api/v1/api-keys` (JWT-only) and revoked via
-  `DELETE /api/v1/api-keys/:id`. Any endpoint that accepts a JWT
-  bearer also accepts a PAT bearer.
-- Per-device secret (`X-Device-Secret`) for device protocol calls
-- Admin key (`X-Admin-Key`) for platform-wide admin endpoints
-- Single-use or reusable enrollment tokens for node registration
-
-A formal, versioned `/api/v2/...` surface exists alongside the v1 endpoints and requires `Wg0-Protocol-Version: 2` plus strict device-secret auth. See DEVICE_PROTOCOL.md for the spec.
+- JWT for owner/admin/dashboard operations
+- Personal Access Tokens (`Authorization: Bearer wg0_pat_...`) for automation and MCP-style tooling
+- Per-device secret (`X-Device-Secret`) for v1 device protocol calls
+- Strict device auth (`X-Device-Secret` + `Wg0-Protocol-Version: 2`) for v2 device and installation endpoints
+- Admin key (`X-Admin-Key`) for `/api/v1/admin/*`
+- Enrollment tokens for bring-your-own-key registration
 
 ## API
 
-- [OpenAPI 3.1 spec](https://wg0.io/openapi.yaml): machine-readable spec for every public endpoint, including v1 owner/enrollment/device paths, v2 device protocol, BYO Exit, traffic, and admin surfaces.
-- [API.md](https://wg0.io/API.md): humans-first quick reference + task recipes for common flows.
-- [MCP server (source)](https://github.com/absginc/ABSLINK-brain/tree/main/mcp): TypeScript stdio server wrapping every wg0 operation as MCP tools. 16 tools, 3 resources, 4 prompts.
-- [MCP integration guide](https://github.com/absginc/ABSLINK-brain/blob/main/docs/MCP.md): install, Claude Desktop / Claude Code config, PAT minting, troubleshooting, tool list, security notes. **Single source of truth** for using wg0 from any MCP-aware agent.
+- [OpenAPI 3.1 spec](https://wg0.io/openapi.yaml): public machine-readable spec for auth, networks, devices, enrollment, nodes, v1/v2 device protocol, BYO Exit, traffic, billing, and admin endpoints.
+- [API.md](https://wg0.io/API.md): human-friendly quick reference with the current device-first model and common task recipes.
+- [DEVICE_PROTOCOL.md](https://github.com/absginc/wg0/blob/main/docs/DEVICE_PROTOCOL.md): the device wire protocol, capability identifiers, and v1/v2 behavior.
 
-## Core documentation
+## Core model
 
-- [README.md](https://github.com/absginc/ABSLINK-brain/blob/main/README.md): repo-level overview, stack, local dev.
-- [DEVICE_PROTOCOL.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/DEVICE_PROTOCOL.md): v1/v2 device protocol spec. What's on the wire between a connector and the brain, migration plan, capability identifiers.
-- [BYO_EXIT.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/BYO_EXIT.md): bring-your-own upstream tunnels attached to a host node (Mullvad, Proton, Azire, custom). Route-all clients inherit the upstream exit on the next heartbeat.
-- [TESTING_ROADMAP.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/TESTING_ROADMAP.md): what's been shipped, what's verified, and the acceptance test for every recent feature.
-- [CHANGELOG.md](https://github.com/absginc/ABSLINK-brain/blob/main/CHANGELOG.md): chronological record of what was fixed/added/changed in each release.
+- **Devices first**: a managed installation is a `device`.
+- **Nodes are memberships**: a `node` is that device's membership in one network.
+- **Networks** can be:
+  - `overlay`
+  - `native`
+- **Relay assist** is a network policy (`relay_mode = never | auto | always`) and now applies to both native and overlay networks.
 
-## Strategy
+## Shipped capabilities
 
-- [ROADBLOCKS.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/ROADBLOCKS.md): current product, platform, protocol, and go-to-market blockers. Read this before making claims about wg0's capabilities.
-- [MARKETING_TAILORS.md](https://github.com/absginc/ABSLINK-brain/blob/main/docs/MARKETING_TAILORS.md): positioning, ICPs, sales motion, use-case page plan. Honest framing of what wg0 can do today versus the roadmap.
+- Managed-device inventory and detail pages
+- Device endpoint history
+- Device mesh / peerings visibility
+- Membership-scoped VPN-through-host control
+- Optional managed-device telemetry collection and storage
+- Native-LAN host placement
+- BYO Exit on hosts
+- Dedicated per-account relay slots for entitled plans
+- Relay-assisted peer recovery with direct/probing/relayed state tracking
 
-## Key concepts
+## Important concepts
 
-- **Overlay vs native-LAN networks**: overlay networks use a private subnet like `10.64.x.x`. Native-LAN networks make remote devices appear as real members of a host's existing LAN subnet (e.g. `192.168.1.0/24`). BYO Exit and route-all are native-LAN features.
-- **Managed vs provisioned devices**: managed devices run an agent that heartbeats and converges desired state. Provisioned devices (QR/mobile via stock WireGuard apps) are peers only — observable via the discover sidecar and host-reported peer observations, but never accept pushed config.
-- **Four-state presence**: every node resolves to one of `online` / `observed` / `offline` / `unknown`. Online + Observed both count as "up" in dashboard aggregates. See the presence rules in DEVICE_PROTOCOL.md and the admin/customer dashboards.
-- **Discover sidecar**: WireGuard-go instance running on a well-known public UDP port. Acts as a STUN-style NAT traversal helper by recording every peer's real post-NAT endpoint. The brain polls discover every 5s and injects observed endpoints into peer maps so NATed peers can reach each other directly.
-- **Route-all**: a per-client toggle that makes the client's native-LAN host act as a full VPN exit node for internet traffic. Stacks with BYO Exit so clients can egress via Mullvad/Proton via the host.
+- **Managed vs provisioned devices**:
+  - managed devices heartbeat and converge desired state
+  - provisioned devices are stock WireGuard peers observed through discover/managed-peer reports
+- **Four-state presence**:
+  - `online`
+  - `observed`
+  - `offline`
+  - `unknown`
+- **Route-all / VPN-through-host**:
+  - a client can default-route through its native host
+  - if the host has a BYO Exit, internet egress happens through the host's upstream
+- **Relay assist is not a public browsing exit**:
+  - the relay helps peers reach each other
+  - internet egress still happens on the host or its BYO Exit, not on the relay public IP
 
-## Not yet
+## Public API families
 
-Read ROADBLOCKS.md before marketing or recommending any of the following:
+- Health: `/health`
+- Auth: `/api/v1/auth/*`
+- API keys: `/api/v1/api-keys*`
+- Accounts/team management: `/api/v1/accounts/*`
+- Device profiles and self-service: `/api/v1/accounts/device-profiles*`, `/api/v1/my-access*`
+- Networks: `/api/v1/networks*`
+- Devices: `/api/v1/devices*`
+- Enrollment: `/api/v1/enroll/*`
+- Nodes and v1 device protocol: `/api/v1/nodes*`
+- Strict v2 device/installations: `/api/v2/devices*`, `/api/v2/installations*`
+- Observability:
+  - `/api/v1/devices/:id/peerings`
+  - `/api/v1/nodes/:id/traffic`
+  - `/api/v1/networks/:id/traffic`
+  - `/api/v1/admin/traffic`
+- BYO Exit: `/api/v1/nodes/:id/upstream-exits*`
+- Billing: `/api/v1/billing/*`
+- Admin: `/api/v1/admin/*`
 
-- Full managed mobile client (today = QR provisioning + observed presence only)
-- Windows parity with Linux/macOS for BYO Exit and split-tunnel
-- Relay layer for symmetric-NAT-vs-symmetric-NAT pairs
-- Fine-grained scopes on personal access tokens (today = full-authority PATs only)
-- Multi-user service accounts (today = PATs belong to a single human account)
-- Per-client BYO Exit selection (today = per-host only)
-- Kill-switch dashboard state for BYO Exit upstream failures
-- OpenAPI-generated SDK; MCP server; llms.txt task-oriented guide
+## Internal services
+
+These are real system components but not part of the public customer OpenAPI:
+
+- **Discover**: public endpoint observation / NAT-assist helper
+- **Relay orchestrator**: per-account relay lifecycle control, secured with `X-Api-Key`
+- **Dedicated relay containers**: one per entitled account/team, each with its own UDP and HTTP control ports
+
+## Not yet / still gated
+
+Read `ROADBLOCKS.md` before making hard claims about any of the following:
+
+- Full managed Windows parity with Linux/macOS shell/native behavior
+- Full managed mobile client parity
+- General-purpose multi-membership runtime on every connector family
+- Fine-grained PAT scopes
+- Multi-user service accounts
+- Public SDK generated from OpenAPI
+
+## Good companion docs
+
+- [README.md](https://github.com/absginc/wg0/blob/main/README.md)
+- [API.md](https://wg0.io/API.md)
+- [DEVICE_PROTOCOL.md](https://github.com/absginc/wg0/blob/main/docs/DEVICE_PROTOCOL.md)
+- [MULTI_NETWORK_INSTALLATION_PLAN.md](https://github.com/absginc/wg0/blob/main/docs/MULTI_NETWORK_INSTALLATION_PLAN.md) — canonical multi-network data model + UX rules
+- [SHARED_NETWORK_INVITES.md](https://github.com/absginc/wg0/blob/main/docs/SHARED_NETWORK_INVITES.md) — cross-account sharing protocol
+- [CONNECTOR_MULTINETWORK_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/CONNECTOR_MULTINETWORK_ROADMAP.md) — per-connector parity status + milestones
+- [SITE_ACCESS_DESIGN.md](https://github.com/absginc/wg0/blob/main/docs/SITE_ACCESS_DESIGN.md) — gateway exports + access grants
+- [BYO_EXIT.md](https://github.com/absginc/wg0/blob/main/docs/BYO_EXIT.md)
+- [ANDROID_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/ANDROID_ROADMAP.md) — native Android app status
+- [WINDOWS_NATIVE_PLAN.md](https://github.com/absginc/wg0/blob/main/docs/WINDOWS_NATIVE_PLAN.md) — native Windows app scope
+- [MACOS_DIAGNOSTICS_AND_RECOVERY_PLAN.md](https://github.com/absginc/wg0/blob/main/docs/MACOS_DIAGNOSTICS_AND_RECOVERY_PLAN.md) — native macOS app status
+- [MCP.md](https://github.com/absginc/wg0/blob/main/docs/MCP.md) — MCP server install + tool list
+- [TESTING_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/TESTING_ROADMAP.md)
+- [ROADBLOCKS.md](https://github.com/absginc/wg0/blob/main/docs/ROADBLOCKS.md)

@@ -1,21 +1,14 @@
-# wg0 MCP server — containerized stdio variant
+# wg0 MCP server — dual-mode container.
 #
-# Usage from Claude Desktop:
+# Default: stdio mode (WG0_MCP_MODE unset). One PAT per process via
+# WG0_API_KEY. Suitable for `docker run -i --rm …` from Claude Desktop.
 #
-#   "wg0": {
-#     "command": "docker",
-#     "args": [
-#       "run", "-i", "--rm",
-#       "-e", "WG0_BRAIN_URL=https://connect.wg0.io",
-#       "-e", "WG0_API_KEY",
-#       "wg0/mcp-server:latest"
-#     ],
-#     "env": { "WG0_API_KEY": "wg0_pat_REPLACE_ME" }
-#   }
+# Long-running HTTP mode: set WG0_MCP_MODE=http and PORT=8090. Exposes
+# Streamable HTTP at /mcp with per-session Bearer auth (PAT today,
+# OAuth access tokens once the brain-side DCR endpoints ship). Use
+# this for `mcp.wg0.io`-style deployments.
 #
-# The container is a plain Node 20 image with the compiled bundle.
-# It runs as a non-root user and has no persistent volumes or
-# exposed ports — stdio is the only interface.
+# Build: docker build -t wg0/mcp-server:latest mcp/
 
 FROM node:20-alpine AS builder
 WORKDIR /app
@@ -35,4 +28,7 @@ COPY --from=builder /app/package.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 USER wg0
+# HTTP mode containers should EXPOSE $PORT at deploy time; stdio mode
+# ignores it. No EXPOSE directive here because stdio is the default
+# and leaving a declared port would be misleading for that variant.
 ENTRYPOINT ["node", "dist/index.js"]

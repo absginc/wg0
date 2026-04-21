@@ -23,13 +23,21 @@ export class Wg0Error extends Error {
 export class Wg0Client {
   constructor(private config: Wg0ClientConfig) {}
 
+  setApiKey(apiKey: string) {
+    this.config.apiKey = apiKey;
+  }
+
+  getApiKey(): string {
+    return this.config.apiKey;
+  }
+
   private headers(): Record<string, string> {
     return {
       Authorization: `Bearer ${this.config.apiKey}`,
       "Content-Type": "application/json",
       // Self-identifying User-Agent so the brain access log tells ops
       // where the request came from.
-      "User-Agent": "wg0-mcp-server/0.1",
+      "User-Agent": "wg0-mcp-server/0.2.0",
     };
   }
 

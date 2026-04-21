@@ -34,8 +34,8 @@ no long-lived browser sessions.
 ## Install
 
 ```bash
-git clone https://github.com/absginc/ABSLINK-brain
-cd ABSLINK-brain/mcp
+git clone https://github.com/absginc/wg0
+cd wg0/mcp
 npm install
 npm run build
 ```
@@ -57,7 +57,7 @@ Add this under `mcpServers`:
   "mcpServers": {
     "wg0": {
       "command": "node",
-      "args": ["/absolute/path/to/ABSLINK-brain/mcp/dist/index.js"],
+      "args": ["/absolute/path/to/wg0/mcp/dist/index.js"],
       "env": {
         "WG0_BRAIN_URL": "https://connect.wg0.io",
         "WG0_API_KEY": "wg0_pat_REPLACE_ME"
@@ -116,7 +116,7 @@ This MCP server is a thin wrapper around the wg0 brain API. It does
 NOT do its own authentication, authorization, or rate limiting —
 every request is made as your PAT, which has the same authority as
 your JWT (full-account access). See
-[docs/ROADBLOCKS.md §9](https://github.com/absginc/ABSLINK-brain/blob/main/docs/ROADBLOCKS.md)
+[docs/ROADBLOCKS.md §9](https://github.com/absginc/wg0/blob/main/docs/ROADBLOCKS.md)
 for the fine-grained scope enforcement roadmap.
 
 Until scopes are enforced:

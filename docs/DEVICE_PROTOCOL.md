@@ -59,6 +59,73 @@ Each of those needs the protocol to be:
 | 4 | Managed vs provisioned | New `device_kind` column on `nodes`. Values: `managed` (runs an agent, heartbeats regularly, accepts desired-state pushes) and `provisioned` (stock WireGuard peer, never heartbeats, only observable via discover/host reports). Brain UIs and presence math already behave differently — this is just making the flag explicit. |
 | 5 | Backward compat | v1 endpoints stay alive. v2 endpoints are additive. v2 clients that don't carry `X-Device-Secret` MAY still be allowed in a grace-period window so existing deployments don't brick on the day we ship. After the grace period, v2 endpoints enforce the header; v1 endpoints never require it. |
 
+### Additive rollout note — managed Devices layer (2026-04-15)
+
+The control plane now has a first-class **Device** row above the old
+per-network `nodes` membership rows.
+
+- `devices` = one managed connector installation
+- `nodes` = one network membership for that installation
+
+This is intentionally **additive**. Existing node-centric APIs continue
+to work, and existing single-network installs do not need reenrollment.
+
+What shipped in this phase:
+
+- managed enroll/register accepts and returns a stable
+  `installation_id`
+- the brain creates a `devices` row for managed connectors and links the
+  initial `nodes` row through `nodes.device_id`
+- the brain exposes:
+  - `GET /api/v1/devices`
+  - `GET /api/v1/devices/:device_id`
+  - `PATCH /api/v1/devices/:device_id`
+  - `POST /api/v1/devices/:device_id/memberships`
+  - `PATCH /api/v1/devices/:device_id/memberships/:node_id`
+  - `DELETE /api/v1/devices/:device_id/memberships/:node_id`
+  - `GET /api/v2/installations/:device_id/state`
+  - `POST /api/v2/installations/:device_id/memberships/:request_id/fulfill`
+- managed connectors now persist a stable `installation_id` outside the
+  per-membership wipe zone and include it in enroll + heartbeat traffic
+
+What is **not** enabled by default yet:
+
+- most clients still run a **single-membership runtime**
+- those clients must **not** advertise `multi_membership_v1`
+- the UI must keep “attach to another network” gated behind the
+  capability until a client can actually run multiple live interfaces
+
+The practical rule is:
+
+**The data model and APIs are multi-membership aware now; runtime
+fan-out remains capability-gated until each client family catches up.**
+
+### Membership lifecycle — connector-side checklist
+
+- **Attach to an additional network.** Preflight first
+  (`POST /api/v1/devices/:id/memberships/preflight`) so the client can
+  surface route conflicts and capability gaps in the user's language.
+  Only then POST the actual attach request. The fulfill path creates
+  a new `nodes` row and returns a wg-quick config — the existing
+  memberships stay up untouched.
+- **Detach from one network.**
+  `DELETE /api/v1/devices/:id/memberships/:node_id`. The device
+  survives, other memberships keep running, the connector's heartbeat
+  loop for the remaining memberships continues unchanged.
+- **Orphan state.** A device with zero memberships is a valid,
+  heartbeating state (not an uninstalled state). Connector UI should
+  read "Ready — no network memberships yet" until a new attach lands.
+- **Revoke mid-session.** If a subsequent desired-state response omits
+  a previously-active membership, tear down its route table before
+  its peer entries, to avoid a brief "traffic to dead tunnel" window.
+
+Per-connector parity status and milestone plan live in
+[CONNECTOR_MULTINETWORK_ROADMAP.md](CONNECTOR_MULTINETWORK_ROADMAP.md).
+Full data-model rules live in
+[MULTI_NETWORK_INSTALLATION_PLAN.md](MULTI_NETWORK_INSTALLATION_PLAN.md).
+Cross-account sharing protocol is in
+[SHARED_NETWORK_INVITES.md](SHARED_NETWORK_INVITES.md).
+
 ---
 
 ## v1 — the current protocol (documented, frozen)

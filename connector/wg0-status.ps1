@@ -1,4 +1,4 @@
-# wg0-status.ps1 — wg0 tunnel status CLI for Windows
+# wg0-status.ps1 - wg0 tunnel status CLI for Windows
 # Run from an elevated PowerShell prompt (Administrator)
 #
 # Usage:
@@ -27,32 +27,45 @@ function Fmt-Bytes($b) {
     elseif ($b -ge 1MB) { "{0:N1} MiB" -f ($b / 1MB) }
     elseif ($b -ge 1KB) { "{0:N1} KiB" -f ($b / 1KB) }
     elseif ($b -gt 0)   { "$b B" }
-    else                { "—" }
+    else                { "-" }
 }
 
 function Get-NodeId {
-    if (Test-Path $NODE_ID_FILE) { (Get-Content $NODE_ID_FILE -Raw).Trim() }
-    else { "not enrolled" }
+    if (Test-Path $NODE_ID_FILE) {
+        return (Get-Content $NODE_ID_FILE -Raw).Trim()
+    }
+    return "not enrolled"
 }
 
 function Get-OverlayIp {
     if (Test-Path $WG_CONF) {
         $line = Get-Content $WG_CONF | Where-Object { $_ -match '^Address\s*=' } | Select-Object -First 1
-        if ($line) { ($line -split '=')[1].Trim() } else { "—" }
-    } else { "—" }
+        if ($line) {
+            return ($line -split '=')[1].Trim()
+        }
+        return "-"
+    }
+    return "-"
 }
 
 function Get-WgStatus {
     $svc = Get-Service -Name $WG_SVC -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq "Running") { "running" } else { "down" }
+    if ($svc -and $svc.Status -eq "Running") {
+        return "running"
+    }
+    return "down"
 }
 
 function Get-HbStatus {
     $task = Get-ScheduledTask -TaskName $HB_TASK -ErrorAction SilentlyContinue
     if ($task) {
         $info = $task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
-        if ($info -and $info.LastTaskResult -eq 0) { "running" } else { "registered" }
-    } else { "not installed" }
+        if ($info -and $info.LastTaskResult -eq 0) {
+            return "running"
+        }
+        return "registered"
+    }
+    return "not installed"
 }
 
 function Get-Peers {
@@ -65,23 +78,30 @@ function Get-Peers {
     foreach ($line in $raw) {
         if ($line -match '^peer:\s*(.+)') {
             if ($cur) { $peers += $cur }
-            $cur = @{ key=$Matches[1]; ep="—"; allowed=""; tx=0; rx=0; hs="never" }
-        } elseif ($cur -and $line -match 'endpoint:\s*(.+)')       { $cur.ep = $Matches[1].Trim() }
-          elseif ($cur -and $line -match 'allowed ips:\s*(.+)')    { $cur.allowed = $Matches[1].Trim() }
-          elseif ($cur -and $line -match 'transfer:\s*(.+)')       {
-              $tf = $Matches[1].Trim()
-              if ($tf -match '([\d.]+)\s+(\w+) received,\s*([\d.]+)\s+(\w+) sent') {
-                  $cur.rx = "$($Matches[1]) $($Matches[2])"
-                  $cur.tx = "$($Matches[3]) $($Matches[4])"
-              }
-          }
-          elseif ($cur -and $line -match 'latest handshake:\s*(.+)') { $cur.hs = $Matches[1].Trim() }
+            $cur = @{ key=$Matches[1]; ep="-"; allowed=""; tx=0; rx=0; hs="never" }
+        }
+        elseif ($cur -and $line -match 'endpoint:\s*(.+)') {
+            $cur.ep = $Matches[1].Trim()
+        }
+        elseif ($cur -and $line -match 'allowed ips:\s*(.+)') {
+            $cur.allowed = $Matches[1].Trim()
+        }
+        elseif ($cur -and $line -match 'transfer:\s*(.+)') {
+            $tf = $Matches[1].Trim()
+            if ($tf -match '([\d.]+)\s+(\w+) received,\s*([\d.]+)\s+(\w+) sent') {
+                $cur.rx = "$($Matches[1]) $($Matches[2])"
+                $cur.tx = "$($Matches[3]) $($Matches[4])"
+            }
+        }
+        elseif ($cur -and $line -match 'latest handshake:\s*(.+)') {
+            $cur.hs = $Matches[1].Trim()
+        }
     }
     if ($cur) { $peers += $cur }
     return $peers
 }
 
-# ── Commands ──────────────────────────────────────────────────────────────────
+# -- Commands ------------------------------------------------------------------
 
 function Cmd-Status {
     $nodeId  = Get-NodeId
@@ -90,23 +110,23 @@ function Cmd-Status {
     $hbState = Get-HbStatus
     $peers   = Get-Peers
 
-    $lastHb = "—"
+    $lastHb = "-"
     if (Test-Path $LOG_PATH) {
         $age = (Get-Date) - (Get-Item $LOG_PATH).LastWriteTime
-        $lastHb = if ($age.TotalSeconds -lt 60) { "{0}s ago" -f [int]$age.TotalSeconds }
-                  elseif ($age.TotalMinutes -lt 60) { "{0}m ago" -f [int]$age.TotalMinutes }
-                  else { "{0}h ago" -f [int]$age.TotalHours }
+        if ($age.TotalSeconds -lt 60) {
+            $lastHb = "{0}s ago" -f [int]$age.TotalSeconds
+        }
+        elseif ($age.TotalMinutes -lt 60) {
+            $lastHb = "{0}m ago" -f [int]$age.TotalMinutes
+        }
+        else {
+            $lastHb = "{0}h ago" -f [int]$age.TotalHours
+        }
     }
 
     if ($Json) {
-        [PSCustomObject]@{
-            node_id       = $nodeId
-            overlay_ip    = $overlay
-            wireguard     = $wgState
-            heartbeat     = $hbState
-            last_heartbeat= $lastHb
-            peer_count    = $peers.Count
-            peers         = $peers | ForEach-Object {
+        $peerJson = @(
+            $peers | ForEach-Object {
                 [PSCustomObject]@{
                     public_key  = $_.key
                     endpoint    = $_.ep
@@ -116,13 +136,22 @@ function Cmd-Status {
                     handshake   = $_.hs
                 }
             }
+        )
+        [PSCustomObject]@{
+            node_id       = $nodeId
+            overlay_ip    = $overlay
+            wireguard     = $wgState
+            heartbeat     = $hbState
+            last_heartbeat= $lastHb
+            peer_count    = $peers.Count
+            peers         = $peerJson
         } | ConvertTo-Json -Depth 5
         return
     }
 
     Write-Host ""
     Write-Host "wg0 Status" -ForegroundColor Cyan
-    Write-Host ("─" * 44)
+    Write-Host ("-" * 44)
     Write-Host ("  {0,-12} {1}" -f "Node ID",   $nodeId)
     Write-Host ("  {0,-12} {1}" -f "Tunnel IP", $overlay)
     $wgColor = if ($wgState -eq "running") { "Green" } else { "Red" }
@@ -135,12 +164,12 @@ function Cmd-Status {
 
     Write-Host ""
     Write-Host ("Peers ({0})" -f $peers.Count) -ForegroundColor Cyan
-    Write-Host ("─" * 44)
+    Write-Host ("-" * 44)
     if ($peers.Count -eq 0) {
-        Write-Host "  No peers yet — heartbeat will sync them within 30s" -ForegroundColor DarkGray
+        Write-Host "  No peers yet - heartbeat will sync them within 30s" -ForegroundColor DarkGray
     }
     foreach ($p in $peers) {
-        Write-Host ("  {0}…" -f $p.key.Substring(0, [Math]::Min(20, $p.key.Length))) -ForegroundColor White
+        Write-Host ("  {0}..." -f $p.key.Substring(0, [Math]::Min(20, $p.key.Length))) -ForegroundColor White
         Write-Host ("    {0,-10} {1}" -f "Allowed",   $p.allowed)
         Write-Host ("    {0,-10} {1}" -f "Endpoint",  $p.ep)
         Write-Host ("    {0,-10} TX {1,-14} RX {2}" -f "Transfer", $p.tx, $p.rx)
@@ -155,7 +184,7 @@ function Cmd-Peers {
     Write-Host ("{0,-22} {1,-22} {2,-20} {3}" -f "PUBLIC KEY", "ALLOWED IPS", "ENDPOINT", "TX / RX")
     foreach ($p in $peers) {
         Write-Host ("{0,-22} {1,-22} {2,-20} {3} / {4}" -f `
-            ($p.key.Substring(0, [Math]::Min(20, $p.key.Length)) + "…"),
+            ($p.key.Substring(0, [Math]::Min(20, $p.key.Length)) + "..."),
             $p.allowed.Substring(0, [Math]::Min(20, $p.allowed.Length)),
             $p.ep, $p.tx, $p.rx)
     }
@@ -167,12 +196,12 @@ function Cmd-Logs {
 }
 
 function Cmd-Version {
-    Write-Host "wg0 — wg0 status CLI (Windows)"
+    Write-Host "wg0 - wg0 status CLI (Windows)"
     Write-Host ("Node ID: {0}" -f (Get-NodeId))
     Write-Host "OS:      Windows"
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 switch ($Command.ToLower()) {
     "status"  { Cmd-Status }
     "peers"   { Cmd-Peers }

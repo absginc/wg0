@@ -125,6 +125,43 @@ docker build -t wg0-connector .
    - Applies changes via `wg syncconf` (no tunnel restart)
 5. On `docker stop`, gracefully tears down the tunnel
 
+## Multi-network: one container per network
+
+The Docker connector is single-interface by design — each container
+holds exactly one `wg0` tunnel. If you want the same host attached to
+multiple wg0 networks (e.g. your `home` network plus a shared `msp-lab`
+network), **run a separate container per network**:
+
+```bash
+# Network 1 — home
+docker run -d --name wg0-home \
+  --cap-add=NET_ADMIN --device=/dev/net/tun \
+  -v wg0-data-home:/etc/wireguard \
+  -e ENROLLMENT_TOKEN=<TOKEN_FOR_HOME> \
+  -e BRAIN_URL=https://connect.wg0.io \
+  -e NODE_NAME=docker-home \
+  wg0-connector:latest
+
+# Network 2 — msp-lab (different volume, different token,
+# different container name)
+docker run -d --name wg0-lab \
+  --cap-add=NET_ADMIN --device=/dev/net/tun \
+  -v wg0-data-lab:/etc/wireguard \
+  -e ENROLLMENT_TOKEN=<TOKEN_FOR_LAB> \
+  -e BRAIN_URL=https://connect.wg0.io \
+  -e NODE_NAME=docker-lab \
+  wg0-connector:latest
+```
+
+Each container enrolls as its own managed device — they do NOT share
+an `installation_id`, so from the brain's perspective they appear as
+two independent nodes (which they are, from a network-isolation
+standpoint). If you need a SINGLE device identity holding multiple
+memberships in one place, use the Linux shell connector
+(`connector.sh attach ...`) or the native Windows/macOS app — both
+drive the `/api/v1/devices/:id/memberships` attach flow. See
+[docs/CONNECTOR_MULTINETWORK_ROADMAP.md](../../docs/CONNECTOR_MULTINETWORK_ROADMAP.md).
+
 ## Logs
 
 ```bash

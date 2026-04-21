@@ -25,13 +25,81 @@ NODE_ID_FILE="${KEY_DIR}/node_id"
 
 # ── OS detection ──────────────────────────────────────────────────────────────
 OS=$(uname -s)
+ARCH=$(uname -m 2>/dev/null || echo "")
+if [[ "$OS" == "Darwin" ]]; then
+    if [[ "$ARCH" == "arm64" ]]; then
+        BREW_PREFIX="/opt/homebrew"
+    else
+        BREW_PREFIX="/usr/local"
+    fi
+    export PATH="${BREW_PREFIX}/bin:${BREW_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 bold()  { printf '\033[1m%s\033[0m' "$*"; }
 green() { printf '\033[32m%s\033[0m' "$*"; }
+yellow(){ printf '\033[33m%s\033[0m' "$*"; }
 red()   { printf '\033[31m%s\033[0m' "$*"; }
 dim()   { printf '\033[2m%s\033[0m' "$*"; }
 line()  { printf '━%.0s' $(seq 1 44); printf '\n'; }
+
+find_bin() {
+    local name="$1"
+    for path in \
+        "${BREW_PREFIX:-}/bin/${name}" \
+        "${BREW_PREFIX:-}/sbin/${name}" \
+        "/usr/local/bin/${name}" \
+        "/usr/local/sbin/${name}" \
+        "/usr/bin/${name}" \
+        "/usr/sbin/${name}"; do
+        [[ -n "$path" && -x "$path" ]] && { printf '%s' "$path"; return 0; }
+    done
+    printf '%s' "$name"
+}
+
+WG_BIN=$(find_bin wg)
+WG_QUICK_BIN=$(find_bin wg-quick)
+
+app_home_dir() {
+    if [[ "$OS" == "Darwin" && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        dscl . -read "/Users/${SUDO_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}'
+    else
+        printf '%s' "${HOME:-}"
+    fi
+}
+
+APP_HOME_DIR=$(app_home_dir)
+APP_HB_STATE_FILE="${APP_HOME_DIR}/Library/Application Support/io.wg0.macos/app_heartbeat_status.json"
+APP_HB_IS_FRESH=0
+APP_HB_LAST_TS=""
+APP_HB_MODE=""
+APP_HB_PID=""
+
+capture_privileged() {
+    local out=""
+    if out=$("$@" 2>/dev/null); then
+        printf '%s' "$out"
+        return 0
+    fi
+    if [[ "$EUID" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+        if out=$(sudo -n "$@" 2>/dev/null); then
+            printf '%s' "$out"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+run_privileged() {
+    if "$@" >/dev/null 2>&1; then
+        return 0
+    fi
+    if [[ "$EUID" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+        sudo -n "$@" >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
 
 fmt_bytes() {
     local b="$1"
@@ -54,13 +122,22 @@ fmt_ago() {
 # ── Resolve WireGuard interface name ─────────────────────────────────────────
 resolve_wg_iface() {
     if [[ "$OS" == "Darwin" ]]; then
-        local name
-        name=$(cat /var/run/wireguard/${WG_IFACE}.name 2>/dev/null \
-            || sudo cat /var/run/wireguard/${WG_IFACE}.name 2>/dev/null) || true
+        local name up_name iface_list candidate
+        name=$(capture_privileged cat /var/run/wireguard/${WG_IFACE}.name || true)
         name=$(echo "$name" | tr -d '[:space:]')
-        if [[ -n "$name" ]]; then
+        if [[ -n "$name" ]] && capture_privileged "$WG_BIN" show "$name" >/dev/null 2>&1; then
             echo "$name"
+        elif capture_privileged "$WG_BIN" show "$WG_IFACE" >/dev/null 2>&1; then
+            echo "$WG_IFACE"
         else
+            up_name=$(capture_privileged cat /var/run/wireguard/wg0-up.name || true)
+            up_name=$(echo "$up_name" | tr -d '[:space:]')
+            iface_list=$(capture_privileged "$WG_BIN" show interfaces || true)
+            for candidate in $iface_list; do
+                [[ -n "$up_name" && "$candidate" == "$up_name" ]] && continue
+                echo "$candidate"
+                return
+            done
             echo "$WG_IFACE"
         fi
     else
@@ -80,11 +157,17 @@ resolve_wg_iface() {
 hb_status() {
     if [[ "$OS" == "Darwin" ]]; then
         local line
-        line=$(launchctl list 2>/dev/null | grep -E 'io\.wg0\.heartbeat|com\.abslink\.heartbeat' | head -1)
+        line=$(launchctl list 2>/dev/null \
+            | awk '/io\.wg0\.heartbeat|com\.abslink\.heartbeat/ { print; exit }' || true)
         if [[ -z "$line" ]]; then
-            line=$(sudo launchctl list 2>/dev/null | grep -E 'io\.wg0\.heartbeat|com\.abslink\.heartbeat' | head -1)
+            line=$(sudo -n launchctl list 2>/dev/null \
+                | awk '/io\.wg0\.heartbeat|com\.abslink\.heartbeat/ { print; exit }' || true)
         fi
         if [[ -z "$line" ]]; then
+            if [[ "${APP_HB_IS_FRESH:-0}" == "1" ]]; then
+                echo "app-managed"
+                return
+            fi
             echo "not loaded"; return
         fi
         local pid exit_code
@@ -98,8 +181,37 @@ hb_status() {
             echo "failing (exit $exit_code)"
         fi
     else
-        systemctl is-active wg0-heartbeat.timer 2>/dev/null || echo "inactive"
+        local state
+        state=$(systemctl is-active wg0-heartbeat.timer 2>/dev/null || true)
+        if [[ -n "$state" ]]; then
+            echo "$state"
+        else
+            echo "inactive"
+        fi
     fi
+}
+
+app_hb_fresh() {
+    APP_HB_IS_FRESH=0
+    APP_HB_LAST_TS=""
+    APP_HB_MODE=""
+    APP_HB_PID=""
+    [[ -f "$APP_HB_STATE_FILE" ]] || return 1
+
+    APP_HB_LAST_TS=$(jq -r '.last_sent_at // empty' "$APP_HB_STATE_FILE" 2>/dev/null || true)
+    APP_HB_MODE=$(jq -r '.tunnel_mode // empty' "$APP_HB_STATE_FILE" 2>/dev/null || true)
+    APP_HB_PID=$(jq -r '.pid // empty' "$APP_HB_STATE_FILE" 2>/dev/null || true)
+
+    [[ "$APP_HB_LAST_TS" =~ ^[0-9]+$ ]] || return 1
+    local now
+    now=$(date +%s)
+    (( now - APP_HB_LAST_TS <= 90 )) || return 1
+
+    if [[ "$APP_HB_PID" =~ ^[0-9]+$ ]]; then
+        kill -0 "$APP_HB_PID" 2>/dev/null || return 1
+    fi
+    APP_HB_IS_FRESH=1
+    return 0
 }
 
 hb_log_path() {
@@ -110,21 +222,42 @@ hb_log_path() {
 wg_running() {
     local iface
     iface=$(resolve_wg_iface)
-    wg show "$iface" >/dev/null 2>&1 || sudo wg show "$iface" >/dev/null 2>&1
+    run_privileged "$WG_BIN" show "$iface"
+}
+
+iface_visible() {
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || return 1
+    ifconfig "$iface" >/dev/null 2>&1
 }
 
 # ── Gather all data ───────────────────────────────────────────────────────────
 gather() {
-    NODE_ID=$(cat "$NODE_ID_FILE" 2>/dev/null || sudo cat "$NODE_ID_FILE" 2>/dev/null || echo "not enrolled")
-    OVERLAY_IP=$(grep -m1 '^Address' "$WG_CONF" 2>/dev/null || sudo grep -m1 '^Address' "$WG_CONF" 2>/dev/null)
-    OVERLAY_IP=$(echo "$OVERLAY_IP" | awk '{print $3}')
-    [[ -z "$OVERLAY_IP" ]] && OVERLAY_IP="—"
+    NODE_ID=$(capture_privileged cat "$NODE_ID_FILE" || echo "not enrolled")
     WG_REAL=$(resolve_wg_iface)
-    WG_OUT=$(wg show "$WG_REAL" 2>/dev/null || sudo wg show "$WG_REAL" 2>/dev/null || echo "")
+    if WG_OUT=$(capture_privileged "$WG_BIN" show "$WG_REAL"); then
+        WG_ACCESS="ok"
+    else
+        WG_OUT=""
+        if [[ "$OS" == "Darwin" && "$EUID" -ne 0 ]]; then
+            WG_ACCESS="needs sudo"
+        else
+            WG_ACCESS="unavailable"
+        fi
+    fi
+    OVERLAY_IP=$(capture_privileged awk '/^[[:space:]]*Address[[:space:]]*=/{print $3; exit}' "$WG_CONF" || true)
+    if [[ -z "$OVERLAY_IP" || "$OVERLAY_IP" == "—" ]] && [[ -n "${WG_REAL:-}" ]]; then
+        OVERLAY_IP=$(capture_privileged ifconfig "$WG_REAL" | awk '/inet / {print $2; exit}' || true)
+    fi
+    [[ -z "$OVERLAY_IP" ]] && OVERLAY_IP="—"
+    app_hb_fresh || true
     HB_STATUS=$(hb_status)
     LOG_PATH=$(hb_log_path)
     LAST_HB="—"
-    if [[ -f "$LOG_PATH" ]]; then
+    if [[ "$HB_STATUS" == "app-managed" && "${APP_HB_IS_FRESH:-0}" == "1" && "$APP_HB_LAST_TS" =~ ^[0-9]+$ ]]; then
+        local now; now=$(date +%s)
+        LAST_HB=$(fmt_ago $((now - APP_HB_LAST_TS)))
+    elif [[ -f "$LOG_PATH" ]]; then
         # Extract timestamp of last run from log (best-effort)
         LAST_HB=$(stat -f "%Sm" -t "%s" "$LOG_PATH" 2>/dev/null \
                   || stat -c "%Y" "$LOG_PATH" 2>/dev/null || echo "")
@@ -198,7 +331,17 @@ cmd_status() {
     gather
 
     local wg_state
-    if wg_running 2>/dev/null; then wg_state="running"; else wg_state="down"; fi
+    if wg_running 2>/dev/null; then
+        wg_state="running"
+    elif [[ "${WG_ACCESS:-ok}" == "needs sudo" ]] && iface_visible "${WG_REAL:-}"; then
+        wg_state="running"
+    else
+        wg_state="down"
+    fi
+    local peer_count=0
+    set +u
+    peer_count=${#PEERS[@]}
+    set -u
 
     local iface_display="$WG_IFACE"
     [[ "$OS" == "Darwin" && "$WG_REAL" != "$WG_IFACE" ]] && iface_display="${WG_IFACE} → ${WG_REAL}"
@@ -209,12 +352,14 @@ cmd_status() {
         printf '  "overlay_ip": "%s",\n' "$OVERLAY_IP"
         printf '  "interface": "%s",\n' "$WG_REAL"
         printf '  "wireguard": "%s",\n' "$wg_state"
+        printf '  "wg_access": "%s",\n' "${WG_ACCESS:-ok}"
         printf '  "heartbeat": "%s",\n' "$HB_STATUS"
         printf '  "last_heartbeat": "%s",\n' "$LAST_HB"
-        printf '  "peer_count": %d,\n' "${#PEERS[@]}"
+        printf '  "peer_count": %d,\n' "$peer_count"
         printf '  "peers": [\n'
         local i=0
-        for p in "${PEERS[@]}"; do
+        for p in "${PEERS[@]-}"; do
+            [[ -z "$p" ]] && continue
             IFS='|' read -r pk ep al tx rx hs <<< "$p"
             [[ $i -gt 0 ]] && printf ',\n'
             printf '    {"public_key":"%s","endpoint":"%s","allowed_ips":"%s","tx":"%s","rx":"%s","handshake":"%s"}' \
@@ -233,29 +378,41 @@ cmd_status() {
     printf '  %-12s %s\n' "Interface" "$iface_display"
     if [[ "$wg_state" == "running" ]]; then
         printf '  %-12s %s\n' "WireGuard" "$(green running)"
+    elif [[ "${WG_ACCESS:-ok}" == "needs sudo" ]]; then
+        printf '  %-12s %s\n' "WireGuard" "$(yellow 'needs sudo for full status')"
     else
         printf '  %-12s %s\n' "WireGuard" "$(red down)"
         printf '  %s: ' "$(dim Restart)"
         if [[ "$OS" == "Darwin" ]]; then
-            printf 'sudo rm -f /var/run/wireguard/wg0.* && sudo wg-quick up %s\n' "$WG_CONF"
+            printf 'sudo rm -f /var/run/wireguard/wg0.* && sudo %s up %s\n' "$WG_QUICK_BIN" "$WG_CONF"
         else
-            printf 'sudo wg-quick up %s\n' "$WG_CONF"
+            printf 'sudo %s up %s\n' "$WG_QUICK_BIN" "$WG_CONF"
         fi
     fi
-    if [[ "$HB_STATUS" == "running" || "$HB_STATUS" == "active" ]]; then
+    if [[ "$HB_STATUS" == "app-managed" ]]; then
+        printf '  %-12s %s\n' "Heartbeat" "$(green running) (app-managed, every 30s)"
+    elif [[ "$HB_STATUS" == "running" || "$HB_STATUS" == "active" ]]; then
         printf '  %-12s %s\n' "Heartbeat" "$(green running) (every 30s)"
     else
         printf '  %-12s %s\n' "Heartbeat" "$(red "$HB_STATUS")"
     fi
     printf '  %-12s %s\n' "Last beat" "$LAST_HB"
+    if [[ "${WG_ACCESS:-ok}" == "needs sudo" ]]; then
+        printf '  %s\n' "$(dim "Tip: run 'sudo wg0 status' on macOS for live WireGuard peer details.")"
+    fi
     printf '\n'
 
-    printf '%s' "$(bold "Peers (${#PEERS[@]})")"; printf '\n'
+    printf '%s' "$(bold "Peers (${peer_count})")"; printf '\n'
     line
-    if [[ ${#PEERS[@]} -eq 0 ]]; then
-        printf '  %s\n' "$(dim 'No peers yet — heartbeat will sync them within 30s')"
+    if [[ ${peer_count} -eq 0 ]]; then
+        if [[ "${WG_ACCESS:-ok}" == "needs sudo" ]]; then
+            printf '  %s\n' "$(dim 'Peer list unavailable without sudo on this macOS session.')"
+        else
+            printf '  %s\n' "$(dim 'No peers yet — heartbeat will sync them within 30s')"
+        fi
     fi
-    for p in "${PEERS[@]}"; do
+    for p in "${PEERS[@]-}"; do
+        [[ -z "$p" ]] && continue
         IFS='|' read -r pk ep al tx rx hs <<< "$p"
         printf '  %s\n' "$(bold "${pk:0:20}…")"
         printf '    %-10s %s\n' "Allowed"   "$al"
@@ -268,11 +425,20 @@ cmd_status() {
 
 cmd_peers() {
     gather
-    if [[ ${#PEERS[@]} -eq 0 ]]; then
+    if [[ "${WG_ACCESS:-ok}" == "needs sudo" ]]; then
+        echo "Run 'sudo wg0 peers' on macOS for live WireGuard peer details."
+        return
+    fi
+    local peer_count=0
+    set +u
+    peer_count=${#PEERS[@]}
+    set -u
+    if [[ ${peer_count} -eq 0 ]]; then
         echo "No peers."; return
     fi
     printf '%-22s %-22s %-20s %s\n' "PUBLIC KEY" "ALLOWED IPS" "ENDPOINT" "TX / RX"
-    for p in "${PEERS[@]}"; do
+    for p in "${PEERS[@]-}"; do
+        [[ -z "$p" ]] && continue
         IFS='|' read -r pk ep al tx rx hs <<< "$p"
         printf '%-22s %-22s %-20s %s / %s\n' "${pk:0:20}…" "${al:0:20}" "${ep:-—}" "$tx" "$rx"
     done

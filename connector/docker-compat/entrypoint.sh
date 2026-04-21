@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# wg0 Docker connector — entrypoint
+# wg0 Docker connector (COMPAT) — userspace WireGuard entrypoint
 #
-# Enrolls with the brain, brings up WireGuard, and heartbeats forever.
-# The heartbeat loop is the foreground process — the container stays
-# alive as long as the tunnel is running.
+# Same behavior as the standard Docker entrypoint, but uses wireguard-go
+# (userspace) instead of the kernel WireGuard module. Works on any Linux
+# host that has /dev/net/tun — no kernel module required.
 #
 # Required environment:
 #   ENROLLMENT_TOKEN   Enrollment token from the dashboard
@@ -14,8 +14,165 @@
 #   ROLE               client (default) or host
 #   ADVERTISED_ROUTES  Comma-separated CIDRs (host mode)
 #   HEARTBEAT_INTERVAL Seconds between heartbeats (default: 30)
+#
+# Docker run requirements:
+#   --cap-add=NET_ADMIN         # create tun device + routes
+#   --device=/dev/net/tun       # REQUIRED — userspace WG needs this
+#   --network host              # for host role (shared netns)
+#   --privileged                # for host role (sysctls, iptables)
+#
+# The Dockerfile sets WG_QUICK_USERSPACE_IMPLEMENTATION=wireguard-go so
+# wg-quick always uses the userspace data plane even when the kernel has
+# WG support. This makes behavior deterministic across hosts.
 
 set -euo pipefail
+
+log() { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
+die() { log "FATAL: $*" >&2; exit 1; }
+
+is_ipv4_cidr() {
+    local value="${1:-}"
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]
+}
+
+first_valid_ipv4_cidr() {
+    local raw="${1:-}" route
+    IFS=',' read -ra routes <<< "$raw"
+    for route in "${routes[@]}"; do
+        route=$(echo "$route" | xargs)
+        [[ -z "$route" ]] && continue
+        if is_ipv4_cidr "$route"; then
+            printf '%s\n' "$route"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Pre-flight: userspace tunnel requirements ────────────────────────────────
+# Userspace WireGuard needs /dev/net/tun. Bail loudly if it's missing — a
+# confusing "wg-quick: ip link failed" error later is worse than failing now.
+if [[ ! -c /dev/net/tun ]]; then
+    echo "[wg0] FATAL: /dev/net/tun not available in this container." >&2
+    echo "       Add --device=/dev/net/tun to docker run." >&2
+    exit 1
+fi
+
+# Force userspace mode (belt-and-suspenders — Dockerfile already sets this).
+export WG_QUICK_USERSPACE_IMPLEMENTATION="${WG_QUICK_USERSPACE_IMPLEMENTATION:-wireguard-go}"
+
+# ── iptables backend detection (CRITICAL for --network host) ─────────────────
+#
+# Alpine's `iptables` is the nft variant. Many host kernels (CentOS 7, older
+# Debian, any box where Docker uses iptables-legacy) read ONLY the legacy
+# xtables API. Rules written to nft on those kernels are phantom rules —
+# they appear in the container's iptables-save output but never hit the
+# actual forwarding path. We discovered this on a CentOS 7 deployment:
+# all rules looked correct from inside the container, tcpdump showed the
+# MASQUERADE wasn't applied, and `iptables-legacy -t nat -I ...` manually
+# on the host fixed it immediately.
+#
+# Fix: install BOTH iptables-legacy and iptables-nft in the image, detect
+# which backend the host's real forwarding path uses, and write rules
+# through that binary. If detection is ambiguous, write to BOTH backends
+# as belt-and-suspenders — the rule either lands in the active table
+# (does its job) or in the dormant one (harmless, cleaned up on shutdown).
+#
+# Detection strategy:
+#   1. If iptables-legacy shows Docker chain rules (DOCKER, DOCKER-USER,
+#      any -A line), host is using legacy → prefer legacy.
+#   2. Else if iptables-nft shows Docker chain rules, prefer nft.
+#   3. Else (both empty or both have rules), use dual-write.
+
+detect_iptables_backend() {
+    local legacy_has_rules=0 nft_has_rules=0
+
+    if command -v iptables-legacy >/dev/null 2>&1; then
+        if iptables-legacy -S FORWARD 2>/dev/null | grep -qE '^-A|DOCKER|-P FORWARD (DROP|REJECT)'; then
+            legacy_has_rules=1
+        fi
+    fi
+    if command -v iptables-nft >/dev/null 2>&1; then
+        if iptables-nft -S FORWARD 2>/dev/null | grep -qE '^-A|DOCKER|-P FORWARD (DROP|REJECT)'; then
+            nft_has_rules=1
+        fi
+    fi
+
+    if [[ "$legacy_has_rules" == "1" && "$nft_has_rules" == "0" ]]; then
+        echo "legacy"
+    elif [[ "$nft_has_rules" == "1" && "$legacy_has_rules" == "0" ]]; then
+        echo "nft"
+    elif [[ "$legacy_has_rules" == "1" && "$nft_has_rules" == "1" ]]; then
+        # Both backends show rules (rare — some transitional distros).
+        # Dual-write so the active path is guaranteed covered.
+        echo "both"
+    else
+        # Neither shows rules. Could be a fresh host or an exotic kernel.
+        # Dual-write is the safe bet.
+        echo "both"
+    fi
+}
+
+IPTABLES_BACKEND=$(detect_iptables_backend)
+case "$IPTABLES_BACKEND" in
+    legacy) IPTABLES_BINS=("iptables-legacy") ;;
+    nft)    IPTABLES_BINS=("iptables-nft") ;;
+    both)   IPTABLES_BINS=("iptables-legacy" "iptables-nft") ;;
+esac
+
+# iptables wrapper — runs the given args against every selected backend.
+# Succeeds if at least one backend accepts the command; errors from a
+# dormant backend (e.g. "Table does not exist") are swallowed.
+iptables_apply() {
+    local rc=1
+    for bin in "${IPTABLES_BINS[@]}"; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            if "$bin" "$@" 2>/dev/null; then
+                rc=0
+            fi
+        fi
+    done
+    return $rc
+}
+
+# iptables check — returns 0 if the rule exists in ANY selected backend.
+# Used with -C to test "does rule already exist" before inserting.
+iptables_check() {
+    for bin in "${IPTABLES_BINS[@]}"; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            if "$bin" "$@" 2>/dev/null; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+log "iptables backend selected: ${IPTABLES_BACKEND} (${IPTABLES_BINS[*]})"
+
+# Back-compat shim: keep $IPTABLES for the single-backend case since the
+# existing code in this script (and the sibling docker/entrypoint.sh) use
+# `$IPTABLES -I ...`. For "both" mode, we'll swap those calls to
+# iptables_apply / iptables_check below (done in setup/cleanup fns).
+IPTABLES="${IPTABLES_BINS[0]}"
+
+# ── Interface name resolution (userspace-specific) ───────────────────────────
+# Userspace WG creates a real TUN interface like "utun5" and records the
+# wg0→utun5 mapping at /var/run/wireguard/wg0.name. Any `ip` / `sysctl`
+# command that references the interface directly must use the resolved
+# name. `wg show`/`wg set`/`wg-quick` handle the aliasing themselves.
+#
+# Returns the real interface name on stdout, or the logical name if we
+# can't resolve (fallback — kernel-WG path).
+resolve_iface() {
+    local logical="${1:-$WG_IFACE}"
+    local name_file="/var/run/wireguard/${logical}.name"
+    if [[ -r "$name_file" ]]; then
+        cat "$name_file"
+    else
+        echo "$logical"
+    fi
+}
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 [[ -z "${ENROLLMENT_TOKEN:-}" ]] && { echo "ERROR: ENROLLMENT_TOKEN is required."; exit 1; }
@@ -41,28 +198,6 @@ NODE_NAME="${NODE_NAME:-$(hostname)}"
 ROLE="${ROLE:-client}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
 
-log() { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
-die() { log "FATAL: $*" >&2; exit 1; }
-
-is_ipv4_cidr() {
-    local value="${1:-}"
-    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]
-}
-
-first_valid_ipv4_cidr() {
-    local raw="${1:-}" route
-    IFS=',' read -ra routes <<< "$raw"
-    for route in "${routes[@]}"; do
-        route=$(echo "$route" | xargs)
-        [[ -z "$route" ]] && continue
-        if is_ipv4_cidr "$route"; then
-            printf '%s\n' "$route"
-            return 0
-        fi
-    done
-    return 1
-}
-
 get_or_create_installation_id() {
     local iid=""
     if [[ -f "$INSTALLATION_ID_FILE" ]]; then
@@ -78,13 +213,11 @@ get_or_create_installation_id() {
 }
 
 current_capabilities_json() {
-    # Docker containers are single-interface by design — one container
-    # per attached network. See connector/docker/README.md for the
-    # "run one wg0-connector container per network" pattern and why
-    # that's cleaner than a multi-iface container. Advertising
-    # multi_membership_v1 anyway so the brain knows the *device*
-    # identity (shared across containers by installation_id) can
-    # participate in the multi-membership flow.
+    # docker-compat (userspace wireguard-go path) follows the same
+    # single-container-per-network model as the standard Docker build.
+    # Advertising multi_membership_v1 so the brain recognizes this
+    # installation as multi-membership-aware even though each container
+    # only holds one membership itself.
     jq -cn '[
         "same_lan_detection",
         "split_tunnel_linux",
@@ -113,7 +246,7 @@ detect_host_lan_ip() {
         fi
     fi
 
-    if [[ -z "$phys_iface" || "$phys_iface" == "$WG_IFACE" ]]; then
+    if [[ -z "$phys_iface" || "$phys_iface" == "$WG_IFACE" || "$phys_iface" == "${REAL_IFACE:-}" ]]; then
         phys_iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
     fi
     [[ -n "$phys_iface" ]] || { echo ""; return; }
@@ -172,49 +305,6 @@ collect_device_telemetry_json() {
     jq -cn --argjson cpu "$cpu_json" --argjson memory "$memory_json" \
         '{battery:null, cpu:$cpu, memory:$memory}'
 }
-
-# ── iptables backend detection (CRITICAL for --network host) ─────────────────
-#
-# Alpine's `iptables` is the nft variant. Many host kernels (CentOS 7, older
-# Debian, anywhere Docker uses iptables-legacy) read ONLY the legacy xtables
-# API. Rules written to nft on those kernels are phantom rules — they
-# appear in the container's iptables-save output but never hit the actual
-# forwarding path.
-#
-# Fix: install BOTH backends, detect which the host's real forwarding path
-# uses, and write rules through that binary. If detection is ambiguous,
-# write to BOTH backends as belt-and-suspenders.
-detect_iptables_backend() {
-    local legacy_has_rules=0 nft_has_rules=0
-    if command -v iptables-legacy >/dev/null 2>&1; then
-        if iptables-legacy -S FORWARD 2>/dev/null | grep -qE '^-A|DOCKER|-P FORWARD (DROP|REJECT)'; then
-            legacy_has_rules=1
-        fi
-    fi
-    if command -v iptables-nft >/dev/null 2>&1; then
-        if iptables-nft -S FORWARD 2>/dev/null | grep -qE '^-A|DOCKER|-P FORWARD (DROP|REJECT)'; then
-            nft_has_rules=1
-        fi
-    fi
-    if [[ "$legacy_has_rules" == "1" && "$nft_has_rules" == "0" ]]; then
-        echo "legacy"
-    elif [[ "$nft_has_rules" == "1" && "$legacy_has_rules" == "0" ]]; then
-        echo "nft"
-    else
-        echo "both"
-    fi
-}
-
-IPTABLES_BACKEND=$(detect_iptables_backend)
-case "$IPTABLES_BACKEND" in
-    legacy) IPTABLES_BINS=("iptables-legacy") ;;
-    nft)    IPTABLES_BINS=("iptables-nft") ;;
-    both)   IPTABLES_BINS=("iptables-legacy" "iptables-nft") ;;
-esac
-# Legacy back-compat for lines still using $IPTABLES (we're transitioning).
-IPTABLES="${IPTABLES_BINS[0]}"
-
-log "iptables backend selected: ${IPTABLES_BACKEND} (${IPTABLES_BINS[*]})"
 
 # ── Config sanitization (applied on every config write) ─────────────────────
 # The brain renders a wg0.conf with PostUp/PreDown commands that are correct
@@ -345,7 +435,12 @@ sanitize_wg_conf
 # ── Bring up WireGuard ───────────────────────────────────────────────────────
 log "Bringing up WireGuard interface ${WG_IFACE}..."
 wg-quick up "$WG_CONF" || die "Failed to bring up WireGuard."
-log "Interface ${WG_IFACE} is up."
+
+# Resolve the real TUN interface created by wireguard-go (e.g. utun5).
+# All subsequent `ip` and `sysctl` commands must use $REAL_IFACE, not
+# $WG_IFACE — the latter is just a logical label aliased via the .name file.
+REAL_IFACE=$(resolve_iface "$WG_IFACE")
+log "Interface ${WG_IFACE} is up (userspace: ${REAL_IFACE})."
 
 # ── Native-LAN host forwarding setup (mirrors connector.sh setup_native_lan_host) ──
 #
@@ -361,19 +456,24 @@ setup_native_lan_host_docker() {
 
     # Detect the physical LAN interface.
     #
-    # On multi-homed hosts (separate management + data NICs), the default
-    # route is often on the management NIC while the advertised LAN subnet
-    # is on a different data NIC. Pick the interface that has a route to
-    # the FIRST advertised CIDR — that's where traffic needs to exit.
+    # On multi-homed hosts (e.g. separate management + data NICs), the default
+    # route is often on the management NIC while the advertised LAN subnet is
+    # on a different data NIC. Pick the interface that has a route to the
+    # FIRST advertised CIDR — that's the one traffic needs to exit through.
     # Only fall back to the default route if we can't find one.
-    local phys_iface first_route probe_ip wan_iface
+    local phys_iface first_route wan_iface
     first_route=$(first_valid_ipv4_cidr "$ADVERTISED_ROUTES" || true)
     if [[ -n "$first_route" ]]; then
+        # `ip route get` picks the kernel's actual routing decision for a
+        # representative IP in the subnet (the network address is fine since
+        # it's a connected route).
+        local probe_ip
         probe_ip=$(echo "$first_route" | cut -d/ -f1)
         phys_iface=$({ ip -4 route get "$probe_ip" 2>/dev/null || true; } | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1); exit}')
     elif [[ -n "$ADVERTISED_ROUTES" ]]; then
         log "WARNING: ADVERTISED_ROUTES='${ADVERTISED_ROUTES}' contains no valid IPv4 CIDRs. Falling back to default-route detection."
     fi
+    # Fallback: default route interface.
     if [[ -z "$phys_iface" || "$phys_iface" == "$WG_IFACE" ]]; then
         phys_iface=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
     fi
@@ -386,7 +486,7 @@ setup_native_lan_host_docker() {
     log "Physical LAN interface: ${phys_iface} (route to ${first_route:-default})"
     echo "$phys_iface" > "${KEY_DIR}/phys_iface" 2>/dev/null || true
 
-    wan_iface=$(ip route show default 2>/dev/null | awk '/^default/ && $5 != "'"${WG_IFACE}"'" && $5 != "wg0-up" {print $5; exit}')
+    wan_iface=$(ip route show default 2>/dev/null | awk '/^default/ && $5 != "'"${WG_IFACE}"'" && $5 != "'"${REAL_IFACE}"'" && $5 != "wg0-up" {print $5; exit}')
     if [[ -n "$wan_iface" ]]; then
         echo "$wan_iface" > "${KEY_DIR}/wan_iface" 2>/dev/null || true
         log "Default WAN interface: ${wan_iface}"
@@ -399,16 +499,19 @@ setup_native_lan_host_docker() {
     # With --network host we're mutating the *host's* shared namespace —
     # leaving ip_forward=1 and rp_filter=0 behind after docker stop would
     # be the same leak we fixed in the Linux connector.
+    # Use $REAL_IFACE (e.g. utun5) since userspace WG doesn't create
+    # a kernel interface literally named wg0.
     local state_file="${KEY_DIR}/sysctl_state"
     if [[ ! -f "$state_file" ]]; then
         {
             echo "ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
             echo "rp_filter_all=$(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 2)"
-            echo "rp_filter_wg=$(cat /proc/sys/net/ipv4/conf/${WG_IFACE}/rp_filter 2>/dev/null || echo 2)"
+            echo "rp_filter_wg=$(cat /proc/sys/net/ipv4/conf/${REAL_IFACE}/rp_filter 2>/dev/null || echo 2)"
             echo "rp_filter_phys=$(cat /proc/sys/net/ipv4/conf/${phys_iface}/rp_filter 2>/dev/null || echo 2)"
             echo "rp_filter_wan=$(cat /proc/sys/net/ipv4/conf/${wan_iface}/rp_filter 2>/dev/null || echo 2)"
-            echo "proxy_arp_wg=$(cat /proc/sys/net/ipv4/conf/${WG_IFACE}/proxy_arp 2>/dev/null || echo 0)"
+            echo "proxy_arp_wg=$(cat /proc/sys/net/ipv4/conf/${REAL_IFACE}/proxy_arp 2>/dev/null || echo 0)"
             echo "phys_iface=${phys_iface}"
+            echo "real_iface=${REAL_IFACE}"
             echo "wan_iface=${wan_iface}"
         } > "$state_file" 2>/dev/null || true
     fi
@@ -423,37 +526,37 @@ setup_native_lan_host_docker() {
         fi
     fi
 
-    # rp_filter — must be 0 on wg0, physical, and all so forwarded packets
-    # aren't dropped when source doesn't match the incoming interface.
-    for iface in all "$WG_IFACE" "$phys_iface"; do
+    # rp_filter — must be 0 on real_iface (utun*), physical, and all so
+    # forwarded packets aren't dropped when source doesn't match the
+    # incoming interface.
+    for iface in all "$REAL_IFACE" "$phys_iface"; do
         sysctl -qw "net.ipv4.conf.${iface}.rp_filter=0" 2>/dev/null || true
     done
     if [[ -n "$wan_iface" && "$wan_iface" != "$phys_iface" ]]; then
         sysctl -qw "net.ipv4.conf.${wan_iface}.rp_filter=0" 2>/dev/null || true
     fi
 
-    # proxy_arp on wg0 — mirrors the Linux shell connector's host setup.
-    # With MASQUERADE alone, return traffic finds its way back via the host's
-    # SNAT'd IP, so strictly speaking proxy_arp isn't required. But keeping
-    # it on wg0 matches the host health model in connector.sh check and
-    # keeps future per-client proxy-ARP work viable. NEVER on "all".
-    sysctl -qw "net.ipv4.conf.${WG_IFACE}.proxy_arp=1" 2>/dev/null || \
-        echo 1 > "/proc/sys/net/ipv4/conf/${WG_IFACE}/proxy_arp" 2>/dev/null || true
+    # proxy_arp on the real TUN interface. iptables / ip / sysctl all refer
+    # to the real kernel interface name (e.g. utun5), not the logical wg0.
+    sysctl -qw "net.ipv4.conf.${REAL_IFACE}.proxy_arp=1" 2>/dev/null || \
+        echo 1 > "/proc/sys/net/ipv4/conf/${REAL_IFACE}/proxy_arp" 2>/dev/null || true
 
-    # iptables FORWARD + NAT — write through EVERY selected backend so rules
-    # land in whichever table the kernel actually consults. Silently-dormant
-    # rules in the other backend are harmless (cleaned up on shutdown).
+    # iptables FORWARD + NAT rules written via iptables_apply, which hits
+    # every selected backend (§ backend detection). This is the critical
+    # section — if these rules land in the wrong backend, the host will
+    # forward packets un-NATed and LAN return traffic will be dropped by
+    # destination devices that don't know to route to the WG client IPs.
     ensure_host_rules() {
         local iface="$1"
         local route
         [[ -z "$iface" ]] && return 0
         for bin in "${IPTABLES_BINS[@]}"; do
             command -v "$bin" >/dev/null 2>&1 || continue
-            if ! "$bin" -C FORWARD -i "$WG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null; then
-                "$bin" -I FORWARD 1 -i "$WG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null || true
+            if ! "$bin" -C FORWARD -i "$REAL_IFACE" -o "$iface" -j ACCEPT 2>/dev/null; then
+                "$bin" -I FORWARD 1 -i "$REAL_IFACE" -o "$iface" -j ACCEPT 2>/dev/null || true
             fi
-            if ! "$bin" -C FORWARD -i "$iface" -o "$WG_IFACE" -j ACCEPT 2>/dev/null; then
-                "$bin" -I FORWARD 1 -i "$iface" -o "$WG_IFACE" -j ACCEPT 2>/dev/null || true
+            if ! "$bin" -C FORWARD -i "$iface" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null; then
+                "$bin" -I FORWARD 1 -i "$iface" -o "$REAL_IFACE" -j ACCEPT 2>/dev/null || true
             fi
             IFS=',' read -ra MASQ_ROUTES <<< "$ADVERTISED_ROUTES"
             for route in "${MASQ_ROUTES[@]}"; do
@@ -467,11 +570,15 @@ setup_native_lan_host_docker() {
     }
 
     ensure_same_tunnel_forward() {
+        local iface
         for bin in "${IPTABLES_BINS[@]}"; do
             command -v "$bin" >/dev/null 2>&1 || continue
-            if ! "$bin" -C FORWARD -i "$WG_IFACE" -o "$WG_IFACE" -j ACCEPT 2>/dev/null; then
-                "$bin" -I FORWARD 1 -i "$WG_IFACE" -o "$WG_IFACE" -j ACCEPT 2>/dev/null || true
-            fi
+            for iface in "$REAL_IFACE" "$WG_IFACE"; do
+                [[ -z "$iface" ]] && continue
+                if ! "$bin" -C FORWARD -i "$iface" -o "$iface" -j ACCEPT 2>/dev/null; then
+                    "$bin" -I FORWARD 1 -i "$iface" -o "$iface" -j ACCEPT 2>/dev/null || true
+                fi
+            done
         done
     }
 
@@ -483,15 +590,16 @@ setup_native_lan_host_docker() {
         for bin in "${IPTABLES_BINS[@]}"; do
             command -v "$bin" >/dev/null 2>&1 || continue
             if "$bin" -t nat -C POSTROUTING -s "$route" -o "$iface" -j MASQUERADE 2>/dev/null; then
-                log "Verified MASQUERADE in ${bin} (route=${route} iface=${iface})"
+                log "Verified MASQUERADE rule exists in ${bin} (route=${route} iface=${iface})"
                 verified=1
             fi
         done
         if [[ "$verified" == "0" ]]; then
             log "═══════════════════════════════════════════════════════════════════"
-            log "⚠ WARNING: MASQUERADE verification FAILED across ${IPTABLES_BINS[*]}"
+            log "⚠ WARNING: MASQUERADE verification FAILED."
+            log "  Rule did not land in any of: ${IPTABLES_BINS[*]}"
             log "  Remote peers will NOT be able to reach destinations via ${iface}."
-            log "  Manual fix on host: iptables -t nat -I POSTROUTING 1 -s ${route} -o ${iface} -j MASQUERADE"
+            log "  Manual fix on the host: iptables -t nat -I POSTROUTING 1 -s ${route} -o ${iface} -j MASQUERADE"
             log "═══════════════════════════════════════════════════════════════════"
         fi
     }
@@ -515,7 +623,7 @@ setup_native_lan_host_docker() {
             is_ipv4_cidr "$route" || continue
             while read -r line; do
                 iface=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-                [[ -z "$iface" || "$iface" == "$WG_IFACE" || "$iface" == "wg0-up" || "$iface" == "lo" ]] && continue
+                [[ -z "$iface" || "$iface" == "$WG_IFACE" || "$iface" == "$REAL_IFACE" || "$iface" == "wg0-up" || "$iface" == "lo" ]] && continue
                 [[ -n "${seen[$iface]:-}" ]] && continue
                 seen["$iface"]=1
                 ifaces+=("$iface")
@@ -536,6 +644,7 @@ setup_native_lan_host_docker() {
     for iface in "${EGRESS_IFACES[@]}"; do
         verify_nat_iface "$iface"
     done
+
     log "Host forwarding configured (backend=${IPTABLES_BACKEND}): LAN=${phys_iface}${wan_iface:+ WAN=${wan_iface}} egress_ifaces=$(printf '%s,' "${EGRESS_IFACES[@]}" | sed 's/,$//')."
 }
 
@@ -547,39 +656,55 @@ setup_native_lan_host_docker
 # the real iptables).
 cleanup_host_forwarding() {
     [[ "$ROLE" == "host" ]] || return 0
-    local phys_iface wan_iface
+    local phys_iface wan_iface real_iface
     phys_iface=$(cat "${KEY_DIR}/phys_iface" 2>/dev/null || true)
     wan_iface=$(cat "${KEY_DIR}/wan_iface" 2>/dev/null || true)
     mapfile -t saved_ifaces < "${EGRESS_IFACES_FILE}" 2>/dev/null || saved_ifaces=()
     [[ -z "$phys_iface" && -z "$wan_iface" && "${#saved_ifaces[@]}" -eq 0 ]] && return 0
 
-    log "Removing host forwarding rules for phys=${phys_iface:-none} wan=${wan_iface:-none} extra=$(printf '%s,' "${saved_ifaces[@]}" | sed 's/,$//') backends=${IPTABLES_BINS[*]}..."
+    # Resolve the real TUN iface name. Prefer the .name file (still exists
+    # at this point — we run before wg-quick down); fall back to saved state.
+    real_iface=$(resolve_iface "$WG_IFACE")
+    if [[ -z "$real_iface" || "$real_iface" == "$WG_IFACE" ]]; then
+        # wg-quick down may have already run; pull from the state file.
+        real_iface=$(grep '^real_iface=' "${KEY_DIR}/sysctl_state" 2>/dev/null | cut -d= -f2)
+    fi
+
+    log "Removing host forwarding rules for phys=${phys_iface:-none} wan=${wan_iface:-none} extra=$(printf '%s,' "${saved_ifaces[@]}" | sed 's/,$//') (real=${real_iface:-?}) backends=${IPTABLES_BINS[*]}..."
+    # Walk every selected backend so we don't leave rules behind if setup
+    # wrote to both (e.g. dual-backend mode).
     for bin in "${IPTABLES_BINS[@]}"; do
         command -v "$bin" >/dev/null 2>&1 || continue
         declare -A seen_ifaces=()
-        for iface in "$phys_iface" "$wan_iface" "${saved_ifaces[@]}"; do
-            [[ -z "$iface" ]] && continue
-            [[ -n "${seen_ifaces[$iface]:-}" ]] && continue
-            seen_ifaces["$iface"]=1
-            while "$bin" -C FORWARD -i "$WG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null; do
-                "$bin" -D FORWARD -i "$WG_IFACE" -o "$iface" -j ACCEPT 2>/dev/null || break
-            done
-            while "$bin" -C FORWARD -i "$iface" -o "$WG_IFACE" -j ACCEPT 2>/dev/null; do
-                "$bin" -D FORWARD -i "$iface" -o "$WG_IFACE" -j ACCEPT 2>/dev/null || break
+        for target_iface in "$phys_iface" "$wan_iface" "${saved_ifaces[@]}"; do
+            [[ -z "$target_iface" ]] && continue
+            [[ -n "${seen_ifaces[$target_iface]:-}" ]] && continue
+            seen_ifaces["$target_iface"]=1
+            for iface in "$real_iface" "$WG_IFACE"; do
+                [[ -z "$iface" ]] && continue
+                while "$bin" -C FORWARD -i "$iface" -o "$target_iface" -j ACCEPT 2>/dev/null; do
+                    "$bin" -D FORWARD -i "$iface" -o "$target_iface" -j ACCEPT 2>/dev/null || break
+                done
+                while "$bin" -C FORWARD -i "$target_iface" -o "$iface" -j ACCEPT 2>/dev/null; do
+                    "$bin" -D FORWARD -i "$target_iface" -o "$iface" -j ACCEPT 2>/dev/null || break
+                done
             done
             if [[ -n "${ADVERTISED_ROUTES:-}" ]]; then
                 IFS=',' read -ra MASQ_ROUTES <<< "$ADVERTISED_ROUTES"
                 for route in "${MASQ_ROUTES[@]}"; do
                     route=$(echo "$route" | xargs)
                     [[ -z "$route" ]] && continue
-                    while "$bin" -t nat -C POSTROUTING -s "$route" -o "$iface" -j MASQUERADE 2>/dev/null; do
-                        "$bin" -t nat -D POSTROUTING -s "$route" -o "$iface" -j MASQUERADE 2>/dev/null || break
+                    while "$bin" -t nat -C POSTROUTING -s "$route" -o "$target_iface" -j MASQUERADE 2>/dev/null; do
+                        "$bin" -t nat -D POSTROUTING -s "$route" -o "$target_iface" -j MASQUERADE 2>/dev/null || break
                     done
                 done
             fi
         done
-        while "$bin" -C FORWARD -i "$WG_IFACE" -o "$WG_IFACE" -j ACCEPT 2>/dev/null; do
-            "$bin" -D FORWARD -i "$WG_IFACE" -o "$WG_IFACE" -j ACCEPT 2>/dev/null || break
+        for iface in "$real_iface" "$WG_IFACE"; do
+            [[ -z "$iface" ]] && continue
+            while "$bin" -C FORWARD -i "$iface" -o "$iface" -j ACCEPT 2>/dev/null; do
+                "$bin" -D FORWARD -i "$iface" -o "$iface" -j ACCEPT 2>/dev/null || break
+            done
         done
     done
 }
@@ -592,16 +717,19 @@ cleanup_sysctl_state() {
     local state_file="${KEY_DIR}/sysctl_state"
     [[ -f "$state_file" ]] || return 0
 
-    local ip_forward rp_filter_all rp_filter_wg rp_filter_phys rp_filter_wan proxy_arp_wg phys_iface wan_iface
+    local ip_forward rp_filter_all rp_filter_wg rp_filter_phys rp_filter_wan proxy_arp_wg phys_iface wan_iface real_iface
     # shellcheck disable=SC1090
     source "$state_file"
 
+    # real_iface (e.g. utun5) will likely be gone after wg-quick down —
+    # the sysctl writes for it will silently no-op, which is correct.
     log "Restoring host sysctl state..."
     [[ -n "${ip_forward:-}" ]]      && sysctl -qw "net.ipv4.ip_forward=${ip_forward}" 2>/dev/null || true
     [[ -n "${rp_filter_all:-}" ]]   && sysctl -qw "net.ipv4.conf.all.rp_filter=${rp_filter_all}" 2>/dev/null || true
-    # wg0 will be gone after wg-quick down — no-op if interface doesn't exist.
-    [[ -n "${rp_filter_wg:-}" ]]    && sysctl -qw "net.ipv4.conf.${WG_IFACE}.rp_filter=${rp_filter_wg}" 2>/dev/null || true
-    [[ -n "${proxy_arp_wg:-}" ]]    && sysctl -qw "net.ipv4.conf.${WG_IFACE}.proxy_arp=${proxy_arp_wg}" 2>/dev/null || true
+    if [[ -n "${real_iface:-}" ]]; then
+        [[ -n "${rp_filter_wg:-}" ]] && sysctl -qw "net.ipv4.conf.${real_iface}.rp_filter=${rp_filter_wg}" 2>/dev/null || true
+        [[ -n "${proxy_arp_wg:-}" ]] && sysctl -qw "net.ipv4.conf.${real_iface}.proxy_arp=${proxy_arp_wg}" 2>/dev/null || true
+    fi
     if [[ -n "${phys_iface:-}" && -n "${rp_filter_phys:-}" ]]; then
         sysctl -qw "net.ipv4.conf.${phys_iface}.rp_filter=${rp_filter_phys}" 2>/dev/null || true
     fi
@@ -617,18 +745,21 @@ cleanup_sysctl_state() {
 cleanup_installed_routes() {
     local routes_file="${KEY_DIR}/installed_routes"
     [[ -f "$routes_file" ]] || return 0
+    local iface
+    iface=$(resolve_iface "$WG_IFACE")
     while read -r cidr; do
         [[ -z "$cidr" ]] && continue
-        ip route del "$cidr" dev ${WG_IFACE} 2>/dev/null || true
+        ip route del "$cidr" dev "$iface" 2>/dev/null || true
     done < "$routes_file"
     rm -f "$routes_file" 2>/dev/null || true
 }
 
 cleanup_route_all_state() {
-    local prev endpoint_ip
+    local prev endpoint_ip iface
     prev=$(cat "$ROUTE_ALL_STATE" 2>/dev/null || echo "off")
-    ip route del 0.0.0.0/1 dev ${WG_IFACE} 2>/dev/null || true
-    ip route del 128.0.0.0/1 dev ${WG_IFACE} 2>/dev/null || true
+    iface=$(resolve_iface "$WG_IFACE")
+    ip route del 0.0.0.0/1 dev "$iface" 2>/dev/null || true
+    ip route del 128.0.0.0/1 dev "$iface" 2>/dev/null || true
     if [[ "$prev" == on* ]]; then
         endpoint_ip="${prev#*|}"
         [[ -n "$endpoint_ip" ]] && ip route del "${endpoint_ip}/32" 2>/dev/null || true
@@ -650,7 +781,7 @@ trap cleanup SIGTERM SIGINT
 # ── Host default-exit health probe ───────────────────────────────────────────
 get_default() {
     ip route show default 2>/dev/null \
-        | awk '/^default/ && $5 != "'"${WG_IFACE}"'" && $5 != "wg0-up" {print $5, $3; exit}'
+        | awk '/^default/ && $5 != "'"${WG_IFACE}"'" && $5 != "'"${REAL_IFACE}"'" && $5 != "wg0-up" {print $5, $3; exit}'
 }
 
 default_exit_route() {
@@ -675,7 +806,7 @@ build_default_exit_health_json() {
 
     local wan_iface wan_gw interface_up=false nat_ok=false forward_ok=false route now_ts
     read -r wan_iface wan_gw < <(default_exit_route)
-    if [[ -z "$wan_iface" || "$wan_iface" == "$WG_IFACE" || "$wan_iface" == "wg0-up" ]]; then
+    if [[ -z "$wan_iface" || "$wan_iface" == "$WG_IFACE" || "$wan_iface" == "$REAL_IFACE" || "$wan_iface" == "wg0-up" ]]; then
         echo '{"interface_up": false, "last_handshake": null}'
         return
     fi
@@ -683,8 +814,8 @@ build_default_exit_health_json() {
     [[ -d "/sys/class/net/${wan_iface}" ]] && interface_up=true
 
     if $interface_up; then
-        if iptables_rule_present_any -C FORWARD -i "$WG_IFACE" -o "$wan_iface" -j ACCEPT \
-            && iptables_rule_present_any -C FORWARD -i "$wan_iface" -o "$WG_IFACE" -j ACCEPT; then
+        if iptables_rule_present_any -C FORWARD -i "$REAL_IFACE" -o "$wan_iface" -j ACCEPT \
+            && iptables_rule_present_any -C FORWARD -i "$wan_iface" -o "$REAL_IFACE" -j ACCEPT; then
             forward_ok=true
         fi
 
@@ -837,8 +968,8 @@ while true; do
         if [[ -n "$DEFAULT_GW" && -n "$ENDPOINT_IP" ]]; then
             ip route replace "${ENDPOINT_IP}/32" via "$DEFAULT_GW" 2>/dev/null || true
         fi
-        ip route replace 0.0.0.0/1 dev ${WG_IFACE} 2>/dev/null || true
-        ip route replace 128.0.0.0/1 dev ${WG_IFACE} 2>/dev/null || true
+        ip route replace 0.0.0.0/1 dev "$REAL_IFACE" 2>/dev/null || true
+        ip route replace 128.0.0.0/1 dev "$REAL_IFACE" 2>/dev/null || true
         echo "on|${ENDPOINT_IP}" > "$ROUTE_ALL_STATE"
     elif [[ "$ROUTE_ALL_PREV" == on* ]]; then
         cleanup_route_all_state
@@ -868,16 +999,16 @@ while true; do
         # Install system routes + record each CIDR for diff.
         echo "$ALLOWED" | tr ',' '\n' | tr -d ' ' | while read -r cidr; do
             [[ -z "$cidr" || "$cidr" == "0.0.0.0/0" ]] && continue
-            ip route replace "$cidr" dev ${WG_IFACE} 2>/dev/null || true
+            ip route replace "$cidr" dev "$REAL_IFACE" 2>/dev/null || true
             echo "$cidr" >> "${INSTALLED_ROUTES_FILE}.new"
         done
     done
 
     echo "$RESPONSE" | jq -c '.probe_peers // []' > "$PROBE_PEERS_FILE" 2>/dev/null || true
 
-    # Shadow direct-probe peers: keep the direct path warm with endpoint +
-    # keepalive only, but never let it claim any routes until the brain
-    # promotes it back to the active carrier.
+    # Shadow direct-probe peers: keep the direct path alive with endpoint +
+    # keepalive only, but do not claim any routes on this peer. The relay
+    # (or current direct carrier) remains the sole owner of AllowedIPs.
     echo "$RESPONSE" | jq -c '.probe_peers[]?' 2>/dev/null | while read -r peer; do
         PUBKEY=$(echo "$peer" | jq -r '.public_key // empty')
         EP=$(echo "$peer" | jq -r '.endpoint // empty')
@@ -893,7 +1024,7 @@ while true; do
             echo "$PREV_ROUTES" | while read -r old_cidr; do
                 [[ -z "$old_cidr" ]] && continue
                 if ! grep -qxF "$old_cidr" "${INSTALLED_ROUTES_FILE}.sorted" 2>/dev/null; then
-                    ip route del "$old_cidr" dev ${WG_IFACE} 2>/dev/null || true
+                    ip route del "$old_cidr" dev "$REAL_IFACE" 2>/dev/null || true
                 fi
             done
         fi
@@ -904,7 +1035,7 @@ while true; do
         if [[ -n "$PREV_ROUTES" ]]; then
             echo "$PREV_ROUTES" | while read -r old_cidr; do
                 [[ -z "$old_cidr" ]] && continue
-                ip route del "$old_cidr" dev ${WG_IFACE} 2>/dev/null || true
+                ip route del "$old_cidr" dev "$REAL_IFACE" 2>/dev/null || true
             done
         fi
         rm -f "$INSTALLED_ROUTES_FILE" 2>/dev/null || true
