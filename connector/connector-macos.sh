@@ -24,6 +24,10 @@
 set -euo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# Connector version. Bumped each time this script changes in a way
+# users need to redeploy — heartbeat carries this so the portal can
+# show an "update available" badge.
+CONNECTOR_VERSION="2026.04.22-b"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -40,6 +44,7 @@ POSTUP_SCRIPT="/usr/local/bin/wg0-postup"
 PREDOWN_SCRIPT="/usr/local/bin/wg0-predown"
 LAUNCHDAEMON_PLIST="/Library/LaunchDaemons/io.wg0.heartbeat.plist"
 WG_WATCHDOG_PLIST="/Library/LaunchDaemons/io.wg0.wireguard.plist"
+HB_WATCHDOG_PLIST="/Library/LaunchDaemons/io.wg0.heartbeat-watchdog.plist"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
@@ -336,6 +341,7 @@ TELEMETRY_JSON=\$(collect_device_telemetry_json)
 
 HB_BODY=\$(jq -cn \\
     --arg endpoint "\$ENDPOINT" \\
+    --arg connector_version "${CONNECTOR_VERSION}" \\
     --argjson installation_id "\$INSTALLATION_ID_JSON" \\
     --argjson capabilities "\$CAPABILITIES_JSON" \\
     --argjson tx_bytes \$TX_BYTES \\
@@ -348,7 +354,7 @@ HB_BODY=\$(jq -cn \\
     '{endpoint:\$endpoint, installation_id:\$installation_id, capabilities:\$capabilities,
       host_lan_ip:\$host_lan_ip, tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, peers:\$peers,
       route_all_active:\$route_all_active, upstream_exit_health:\$upstream_exit_health,
-      telemetry:\$telemetry}')
+      telemetry:\$telemetry, connector_version:\$connector_version}')
 
 CURL_ARGS=( -sf -X POST -H "Content-Type: application/json" )
 [[ -n "\$DEVICE_SECRET" ]] && CURL_ARGS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
@@ -758,7 +764,8 @@ for att_dir in /etc/wireguard/wg* ; do
         --argjson rx_bytes "\$att_rx" \\
         --argjson installation_id "\$INSTALLATION_ID_JSON" \\
         --argjson capabilities "\$ATTACHED_CAPABILITIES_JSON" \\
-        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities}')
+        --arg connector_version "${CONNECTOR_VERSION}" \\
+        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, connector_version:\$connector_version}')
     ATT_HEADERS=( -H "Content-Type: application/json" )
     [[ -n "\$DEVICE_SECRET" ]] && ATT_HEADERS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
     curl -sf -X POST "\${ATT_HEADERS[@]}" \\
@@ -1001,7 +1008,7 @@ if [[ "$SUBCMD" == "attach" ]]; then
     wg-quick up "$ATTACH_CONF" || die "wg-quick up ${ATTACH_CONF} failed."
 
     log "Attached! ${next_iface} → ${ATTACH_OVERLAY} (node_id=${ATTACH_NODE_ID})"
-    log "Note: heartbeats for attached memberships need the per-interface timer (coming in a follow-up)."
+    log "The wg0-heartbeat launchd job will start reporting for ${next_iface} on its next tick (~30s)."
     exit 0
 fi
 
@@ -1126,6 +1133,43 @@ if [[ "$SUBCMD" == "update" ]]; then
         log "WireGuard watchdog reloaded as io.wg0.wireguard"
     fi
 
+    # ── Heartbeat watchdog — idempotent install/refresh ─────────────────────
+    # `enroll` writes this; `update` on an existing install without it
+    # didn't — so write it here so the -b upgrade converges cleanly.
+    # Watchdog kickstarts io.wg0.heartbeat every 120s if its log is stale.
+    if [[ -f "$HB_WATCHDOG_PLIST" ]]; then
+        launchctl unload "$HB_WATCHDOG_PLIST" 2>/dev/null || true
+    fi
+    cat > "$HB_WATCHDOG_PLIST" <<HBWPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.wg0.heartbeat-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>LOG=/var/log/wg0-heartbeat.log; STALE=120; if [[ ! -f "\$LOG" ]] || (( \$(date +%s) - \$(stat -f %m "\$LOG" 2>/dev/null || echo 0) > STALE )); then launchctl kickstart -k system/io.wg0.heartbeat 2>/dev/null || launchctl load ${LAUNCHDAEMON_PLIST} 2>/dev/null; echo "[\$(date -u +%H:%M:%SZ)] watchdog: kicked heartbeat (stale >\${STALE}s)" >> /var/log/wg0-heartbeat-watchdog.log; fi</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/wg0-heartbeat-watchdog.log</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/wg0-heartbeat-watchdog.log</string>
+</dict>
+</plist>
+HBWPLIST
+    if launchctl load "$HB_WATCHDOG_PLIST" 2>/dev/null; then
+        log "Heartbeat watchdog installed/refreshed (io.wg0.heartbeat-watchdog)"
+    else
+        warn "launchctl load of heartbeat watchdog failed — stalls will not self-heal"
+    fi
+
     # ── 6. Migrate legacy postup/predown scripts ────────────────────────────
     for pair in "abslink-postup:wg0-postup" "abslink-predown:wg0-predown"; do
         old="/usr/local/bin/${pair%%:*}"
@@ -1200,6 +1244,12 @@ if [[ "$SUBCMD" == "unenroll" ]]; then
         done || true)
     fi
     [[ -n "$UTUN" ]] && ifconfig "$UTUN" destroy 2>/dev/null || true
+
+    if [[ -f "$HB_WATCHDOG_PLIST" ]]; then
+        log "Removing launchd heartbeat watchdog daemon..."
+        launchctl unload "$HB_WATCHDOG_PLIST" 2>/dev/null || true
+        rm -f "$HB_WATCHDOG_PLIST"
+    fi
 
     if [[ -f "$WG_WATCHDOG_PLIST" ]]; then
         log "Removing launchd WireGuard watchdog daemon..."
@@ -1491,6 +1541,49 @@ if launchctl load "$WG_WATCHDOG_PLIST" 2>/dev/null; then
     log "  Logs: /var/log/wg0-wireguard.log"
 else
     warn "WireGuard watchdog launchctl load failed — WireGuard will not auto-restart."
+fi
+
+# ── Install heartbeat watchdog — kicks stale io.wg0.heartbeat back to life ────
+# If launchd drops a StartInterval tick (seen in the wild: a Mac woke from
+# sleep and the heartbeat label went silent for hours), this daemon kickstarts
+# it on the next 2-minute cycle. Independent of the heartbeat plist so a
+# breakage in one doesn't silence the other.
+log "Installing launchd heartbeat watchdog daemon..."
+
+if [[ -f "$HB_WATCHDOG_PLIST" ]]; then
+    launchctl unload "$HB_WATCHDOG_PLIST" 2>/dev/null || true
+fi
+
+cat > "$HB_WATCHDOG_PLIST" <<HBWPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.wg0.heartbeat-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>LOG=/var/log/wg0-heartbeat.log; STALE=120; if [[ ! -f "\$LOG" ]] || (( \$(date +%s) - \$(stat -f %m "\$LOG" 2>/dev/null || echo 0) > STALE )); then launchctl kickstart -k system/io.wg0.heartbeat 2>/dev/null || launchctl load ${LAUNCHDAEMON_PLIST} 2>/dev/null; echo "[\$(date -u +%H:%M:%SZ)] watchdog: kicked heartbeat (stale >\${STALE}s)" >> /var/log/wg0-heartbeat-watchdog.log; fi</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/wg0-heartbeat-watchdog.log</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/wg0-heartbeat-watchdog.log</string>
+</dict>
+</plist>
+HBWPLIST
+
+if launchctl load "$HB_WATCHDOG_PLIST" 2>/dev/null; then
+    log "Heartbeat watchdog installed (launchd, checks every 120s, kicks stale heartbeat)."
+    log "  Logs: /var/log/wg0-heartbeat-watchdog.log"
+else
+    warn "Heartbeat watchdog launchctl load failed — stalls will not self-heal."
 fi
 
 # ── Install wg0 status CLI ────────────────────────────────────────────────────

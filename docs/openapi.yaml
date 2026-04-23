@@ -2128,6 +2128,15 @@ components:
           type: array
           nullable: true
           items: { type: string }
+        connector_version:
+          type: string
+          nullable: true
+          description: |
+            Short connector build identifier (e.g. `linux-shell-0.4.1`,
+            `macos-native-0.2.4`, `windows-native-gg`,
+            `android-native-alpha19`). Added 2026-04-22. Stored on
+            `nodes.connector_version` and surfaced in the portal's
+            "Update available" pill.
         tx_bytes: { type: integer, format: int64, nullable: true }
         rx_bytes: { type: integer, format: int64, nullable: true }
         host_lan_ip: { type: string, nullable: true }
@@ -2232,6 +2241,22 @@ components:
         network_id: { type: string, format: uuid }
         is_reusable: { type: boolean, default: false }
         expires_at: { type: string, format: date-time, nullable: true }
+        target_device_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Optional. When set, the minted token is bound to an
+            existing `devices` row. On redemption
+            (`POST /api/v1/enroll/register`), the brain takes an
+            UPDATE path on the existing `nodes` row instead of
+            allocating a new overlay IP: `public_key` and
+            `device_secret` rotate, `config_version` bumps, but
+            `node_id`, `overlay_ip`, and lifetime tx/rx counters are
+            preserved. If the target device was deleted between mint
+            and redeem, the brain falls through to the fresh-enroll
+            INSERT path. Added 2026-04-23 for portal-driven
+            re-enroll.
 
     EnrollmentToken:
       type: object
@@ -2328,6 +2353,12 @@ components:
             - byo_exit_macos
             - peer_observations
             - desired_state_convergence
+        connector_version:
+          type: string
+          nullable: true
+          description: |
+            Short connector build identifier (same semantics as the v1
+            heartbeat field). Added 2026-04-22.
         current_state: { $ref: "#/components/schemas/V2CurrentState" }
 
     V2CurrentState:

@@ -59,6 +59,9 @@ $NODE_ID_FILE   = "$DATA_DIR\node_id.txt"
 $HB_SCRIPT      = "$DATA_DIR\heartbeat.ps1"
 $HB_TASK_NAME   = "Wg0Heartbeat"
 $HEARTBEAT_SEC  = 30
+# Connector version. Interpolated into the heartbeat script below via
+# the here-string so the scheduled task reports the correct version.
+$CONNECTOR_VERSION = "2026.04.22-b"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 function Log([string]$msg) {
@@ -269,7 +272,7 @@ try {
     }
 } catch {}
 
-`$body = @{ endpoint = `$endpoint; tx_bytes = `$txBytes; rx_bytes = `$rxBytes } | ConvertTo-Json
+`$body = @{ endpoint = `$endpoint; tx_bytes = `$txBytes; rx_bytes = `$rxBytes; connector_version = '$CONNECTOR_VERSION' } | ConvertTo-Json
 try {
     `$resp = Invoke-RestMethod -Uri '$BrainUrl/api/v1/nodes/`$nodeId/heartbeat' ``
         -Method Post -ContentType 'application/json' -Body `$body -TimeoutSec 10

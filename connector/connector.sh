@@ -42,6 +42,10 @@ ADVERTISED_ROUTES_FILE="${KEY_DIR}/advertised_routes"
 EGRESS_IFACES_FILE="${KEY_DIR}/egress_ifaces"
 HEARTBEAT_INTERVAL=30
 HEARTBEAT_SCRIPT="/usr/local/bin/wg0-heartbeat"
+# Connector version. Bumped each time this script changes in a way
+# users need to redeploy — heartbeat carries this so the portal can
+# show an "update available" badge on stale nodes.
+CONNECTOR_VERSION="2026.04.22-b"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
@@ -466,6 +470,7 @@ TELEMETRY_JSON=\$(collect_device_telemetry_json)
 
 HB_BODY=\$(jq -cn \\
     --arg endpoint "\$ENDPOINT" \\
+    --arg connector_version "${CONNECTOR_VERSION}" \\
     --argjson installation_id "\$INSTALLATION_ID_JSON" \\
     --argjson capabilities "\$CAPABILITIES_JSON" \\
     --argjson tx_bytes \$TX_BYTES \\
@@ -478,7 +483,7 @@ HB_BODY=\$(jq -cn \\
     '{endpoint:\$endpoint, installation_id:\$installation_id, capabilities:\$capabilities,
       host_lan_ip:\$host_lan_ip, tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, peers:\$peers,
       route_all_active:\$route_all_active, upstream_exit_health:\$upstream_exit_health,
-      telemetry:\$telemetry}')
+      telemetry:\$telemetry, connector_version:\$connector_version}')
 
 CURL_ARGS=( -sf -X POST -H "Content-Type: application/json" )
 [[ -n "\$DEVICE_SECRET" ]] && CURL_ARGS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
@@ -800,7 +805,8 @@ for att_dir in /etc/wireguard/wg* ; do
         --argjson rx_bytes "\$att_rx" \\
         --argjson installation_id "\$INSTALLATION_ID_JSON" \\
         --argjson capabilities "\$ATTACHED_CAPABILITIES_JSON" \\
-        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities}')
+        --arg connector_version "${CONNECTOR_VERSION}" \\
+        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, connector_version:\$connector_version}')
     ATT_HEADERS=( -H "Content-Type: application/json" )
     [[ -n "\$DEVICE_SECRET" ]] && ATT_HEADERS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
     curl -sf -X POST "\${ATT_HEADERS[@]}" \\
@@ -1181,8 +1187,7 @@ if [[ "$SUBCMD" == "attach" ]]; then
     fi
 
     log "Attached! ${next_iface} → ${ATTACH_OVERLAY} (node_id=${ATTACH_NODE_ID})"
-    log "Heartbeats for attached memberships need the per-interface heartbeat timer."
-    log "See: https://wg0.io/MULTI_NETWORK_INSTALLATION_PLAN.md"
+    log "The wg0-heartbeat timer will start reporting for ${next_iface} on its next tick (~30s)."
     exit 0
 fi
 
@@ -1310,6 +1315,52 @@ if [[ "$SUBCMD" == "update" ]]; then
         log "Heartbeat timer restarted"
     fi
 
+    # Idempotently install/refresh the main heartbeat unit (pick up
+    # new TimeoutStartSec + log redirection) and the heartbeat
+    # watchdog. `enroll` writes both; `update` on an existing install
+    # without the watchdog didn't — so add it here so the -b upgrade
+    # converges cleanly.
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /etc/systemd/system ]]; then
+        cat > /etc/systemd/system/wg0-heartbeat.service <<EOF
+[Unit]
+Description=wg0 Heartbeat
+
+[Service]
+Type=oneshot
+ExecStart=${HEARTBEAT_SCRIPT}
+ExecStartPost=/bin/sh -c 'touch /var/log/wg0-heartbeat.log'
+TimeoutStartSec=60
+StandardOutput=append:/var/log/wg0-heartbeat.log
+StandardError=append:/var/log/wg0-heartbeat.log
+EOF
+
+        cat > /etc/systemd/system/wg0-heartbeat-watchdog.service <<'EOF'
+[Unit]
+Description=wg0 Heartbeat Watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'LOG=/var/log/wg0-heartbeat.log; STALE=120; if [ ! -f "$LOG" ] || [ $(( $(date +%s) - $(stat -c %Y "$LOG" 2>/dev/null || echo 0) )) -gt "$STALE" ]; then systemctl start wg0-heartbeat.service; echo "[$(date -u +%H:%M:%SZ)] watchdog: kicked heartbeat (stale >${STALE}s)" >> /var/log/wg0-heartbeat-watchdog.log; fi'
+TimeoutStartSec=30
+EOF
+
+        cat > /etc/systemd/system/wg0-heartbeat-watchdog.timer <<'EOF'
+[Unit]
+Description=wg0 Heartbeat Watchdog Timer
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=120s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable --now wg0-heartbeat-watchdog.timer >/dev/null 2>&1 || true
+        log "Heartbeat watchdog installed/refreshed"
+    fi
+
     # Install/update wg0 CLI
     if curl -fsSL "https://wg0.io/wg0-status.sh" -o /usr/local/bin/wg0 2>/dev/null; then
         chmod +x /usr/local/bin/wg0
@@ -1427,14 +1478,19 @@ if [[ "$SUBCMD" == "unenroll" ]]; then
 
     # 4. Stop and disable systemd units
     if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now wg0-heartbeat-watchdog.timer 2>/dev/null || true
+        systemctl disable --now wg0-heartbeat-watchdog.service 2>/dev/null || true
         systemctl disable --now wg0-heartbeat.timer  2>/dev/null || true
         systemctl disable --now wg0-heartbeat.service 2>/dev/null || true
     fi
 
     # 5. Remove systemd unit files and reload daemon
-    if [[ -f /etc/systemd/system/wg0-heartbeat.timer || -f /etc/systemd/system/wg0-heartbeat.service ]]; then
+    if [[ -f /etc/systemd/system/wg0-heartbeat.timer || -f /etc/systemd/system/wg0-heartbeat.service \
+       || -f /etc/systemd/system/wg0-heartbeat-watchdog.timer || -f /etc/systemd/system/wg0-heartbeat-watchdog.service ]]; then
         rm -f /etc/systemd/system/wg0-heartbeat.timer
         rm -f /etc/systemd/system/wg0-heartbeat.service
+        rm -f /etc/systemd/system/wg0-heartbeat-watchdog.timer
+        rm -f /etc/systemd/system/wg0-heartbeat-watchdog.service
         systemctl daemon-reload 2>/dev/null || true
         log "Removed systemd heartbeat units."
     fi
@@ -1808,6 +1864,10 @@ Description=wg0 Heartbeat
 [Service]
 Type=oneshot
 ExecStart=${HEARTBEAT_SCRIPT}
+ExecStartPost=/bin/sh -c 'touch /var/log/wg0-heartbeat.log'
+TimeoutStartSec=60
+StandardOutput=append:/var/log/wg0-heartbeat.log
+StandardError=append:/var/log/wg0-heartbeat.log
 EOF
 
     cat > /etc/systemd/system/wg0-heartbeat.timer <<EOF
@@ -1823,9 +1883,36 @@ OnUnitActiveSec=${HEARTBEAT_INTERVAL}s
 WantedBy=timers.target
 EOF
 
+    # Watchdog: independent timer that kicks the heartbeat if the log hasn't
+    # been written in >120s. Survives a broken heartbeat timer or a hung
+    # previous run that blocked OnUnitActiveSec. Same pattern as macOS.
+    cat > /etc/systemd/system/wg0-heartbeat-watchdog.service <<'EOF'
+[Unit]
+Description=wg0 Heartbeat Watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'LOG=/var/log/wg0-heartbeat.log; STALE=120; if [ ! -f "$LOG" ] || [ $(( $(date +%s) - $(stat -c %Y "$LOG" 2>/dev/null || echo 0) )) -gt "$STALE" ]; then systemctl start wg0-heartbeat.service; echo "[$(date -u +%H:%M:%SZ)] watchdog: kicked heartbeat (stale >${STALE}s)" >> /var/log/wg0-heartbeat-watchdog.log; fi'
+TimeoutStartSec=30
+EOF
+
+    cat > /etc/systemd/system/wg0-heartbeat-watchdog.timer <<'EOF'
+[Unit]
+Description=wg0 Heartbeat Watchdog Timer
+
+[Timer]
+OnBootSec=120s
+OnUnitActiveSec=120s
+
+[Install]
+WantedBy=timers.target
+EOF
+
     systemctl daemon-reload
     systemctl enable --now wg0-heartbeat.timer
+    systemctl enable --now wg0-heartbeat-watchdog.timer
     log "Heartbeat timer installed (systemd, every ${HEARTBEAT_INTERVAL}s)."
+    log "Heartbeat watchdog installed (systemd, every 120s)."
 
 else
     # Non-systemd fallback: background loop (OpenWRT, proprietary channel banks, etc.)

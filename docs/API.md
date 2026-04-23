@@ -98,6 +98,16 @@ Important network fields:
 - `POST /api/v1/devices/:id/memberships` — request attach to another network
 - `PATCH /api/v1/devices/:id/memberships/:node_id` — update one membership
 - `DELETE /api/v1/devices/:id/memberships/:node_id` — remove one membership
+- `GET /api/v1/devices/:id/memberships/:node_id/peers` — list effective peer
+  config (overlay IP + advertised routes + any per-peer `allowed_ips` override)
+  as the connector sees it on this membership
+- `PATCH /api/v1/devices/:id/memberships/:node_id/peers/:peer_node_id` —
+  set or clear a per-peer `allowed_ips` override for this membership.
+  Body: `{ "override_allowed_ips": [...] }` to set, `{ "override_allowed_ips": null }`
+  to clear. Bumps the viewer node's `config_version`; connectors pick
+  up the new `allowed_ips` on the next heartbeat without tearing down
+  the tunnel. Shipped 2026-04-22; see
+  [ADVANCED_PEER_SETTINGS_PLAN.md](ADVANCED_PEER_SETTINGS_PLAN.md).
 
 This is the permanent control-plane home for:
 - memberships (including multi-network: one device can hold many
@@ -133,6 +143,23 @@ for per-connector support status.
 
 Managed enrollments now return `device_id` and `installation_id` in addition to the node membership identity.
 
+**Re-enroll / identity-bound tokens (shipped 2026-04-23).** Both
+`POST /api/v1/enroll/generate-token` and
+`POST /api/v1/shared-networks/:membership_id/enroll-token` accept an
+optional `target_device_id` in the body. When set, the brain records
+the target on the token row. Redemption (`POST /api/v1/enroll/register`)
+branches on it: if the token carries `target_device_id` AND the device
+still exists, the brain takes an UPDATE path — the existing
+`nodes` row keeps its `node_id` + `overlay_ip`, only
+`public_key` + `device_secret_hash` rotate, `config_version` bumps
+to force other peers to re-fetch, and tx/rx lifetime counters are
+preserved (only `*_last_report` anchors reset). If the target was
+deleted between mint and redeem, the brain falls through to the
+existing INSERT path. Used by the portal's per-row "Re-enroll"
+button to avoid consuming another overlay IP on every reinstall.
+See [ROADBLOCKS.md §15 "2026-04-23 — Re-enroll was creating a new
+node"](ROADBLOCKS.md) for the why.
+
 ### Nodes — compatibility and owner surface
 - `GET /api/v1/nodes`
 - `PATCH /api/v1/nodes/:id`
@@ -158,6 +185,14 @@ The v1 heartbeat now carries newer optional fields too:
 - `upstream_exit_health`
 - `route_all_active`
 - `telemetry`
+- `connector_version` — short string the connector stamps into each
+  heartbeat (e.g. `linux-shell-0.4.1`, `macos-native-0.2.4`,
+  `windows-native-gg`, `android-native-alpha19`). Stored on `nodes`
+  and surfaced in the portal's NodeTable so operators can see
+  "Update available" pills when a device is behind the latest
+  build. Added 2026-04-22 across every shell connector + macOS,
+  Windows, and Android native apps. The same field is accepted on
+  the v2 state report.
 
 ### Device protocol v2 (strict)
 - `POST /api/v2/devices/:id/state`

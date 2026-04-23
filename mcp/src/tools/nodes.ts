@@ -61,13 +61,23 @@ export function nodeTools(client: Wg0Client): Tool[] {
       inputSchema: z.object({
         node_id: z.string().uuid(),
       }),
-      handler: async ({ node_id }) =>
-        client.delete(`/api/v1/nodes/${node_id}`),
+      handler: async ({ node_id }) => {
+        // Brain returns 204 with no body on success. The MCP runtime
+        // can't encode `undefined` into a content block, so wrap the
+        // outcome in a concrete object — otherwise callers see a
+        // cosmetic "response-parsing" error on success.
+        await client.delete(`/api/v1/nodes/${node_id}`);
+        return {
+          deleted: true,
+          node_id,
+          status: "Node removed. Its entry is gone from the brain; any peers that had it in their AllowedIPs will refresh on their next heartbeat.",
+        };
+      },
     },
     {
       name: "provision_device",
       description:
-        "Server-side keygen + enroll for a mobile / QR-flow device. The brain generates a WireGuard keypair, enrolls a new node as device_kind='provisioned', and returns the full wg_config text with the PrivateKey line already populated. The dashboard renders this as a QR code for stock WireGuard mobile apps. The private key is returned ONCE and never persisted.",
+        "Server-side keygen + enroll for a stock-WireGuard-compatible mobile QR. The brain generates a WireGuard keypair, enrolls a node as device_kind='provisioned', and returns the full wg_config text with the PrivateKey line populated — render that as a QR for the stock WireGuard app (Android/iOS App Store) to consume. The private key is returned ONCE and never persisted. IMPORTANT: do NOT use this for the wg0 native apps. The wg0 Android native app (alpha18+) and future wg0 iOS app expect a `wg0://enroll?token=…&base=…` URI — mint one via `generate_enrollment_token` and render the returned `managed_enroll_uri` as a QR. The wg0 native path is preferred because the device generates its own keypair locally and no private key crosses the wire.",
       inputSchema: z.object({
         network_id: z.string().uuid(),
         node_name: z.string(),

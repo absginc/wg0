@@ -179,6 +179,8 @@ resolve_iface() {
 [[ -z "${BRAIN_URL:-}" ]] && { echo "ERROR: BRAIN_URL is required."; exit 1; }
 
 BRAIN_URL="${BRAIN_URL%/}"
+# Connector version bumped per release — portal flags stale nodes.
+CONNECTOR_VERSION="2026.04.22-b"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/wg0.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -485,6 +487,21 @@ setup_native_lan_host_docker() {
     fi
     log "Physical LAN interface: ${phys_iface} (route to ${first_route:-default})"
     echo "$phys_iface" > "${KEY_DIR}/phys_iface" 2>/dev/null || true
+
+    # Bridge-mode sanity check — see connector/docker/entrypoint.sh
+    # for the rationale. Default Docker bridge gives 172.16-31.0.0/12
+    # addresses; if that's what phys_iface carries, the host isn't in
+    # --network host mode and LAN-placement forwarding will silently
+    # fail for real LAN devices.
+    local phys_ip_first
+    phys_ip_first=$(ip -4 -o addr show dev "$phys_iface" 2>/dev/null | awk '{print $4}' | head -1 | cut -d/ -f1)
+    if [[ "$phys_ip_first" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+        log "WARNING: ${phys_iface} has IP ${phys_ip_first}, which looks like a Docker bridge."
+        log "         This container is likely NOT running with 'network_mode: host'."
+        log "         Wg0 clients will be able to reach each other via the overlay,"
+        log "         but cannot reach real LAN devices (10.0.0.1, 192.168.x.x) through this host."
+        log "         Fix: switch the compose service to 'network_mode: host' and restart."
+    fi
 
     wan_iface=$(ip route show default 2>/dev/null | awk '/^default/ && $5 != "'"${WG_IFACE}"'" && $5 != "'"${REAL_IFACE}"'" && $5 != "wg0-up" {print $5; exit}')
     if [[ -n "$wan_iface" ]]; then
@@ -890,6 +907,7 @@ while true; do
     # ── Send heartbeat ──
     HB_BODY=$(jq -cn \
         --arg endpoint "$ENDPOINT" \
+        --arg connector_version "${CONNECTOR_VERSION}" \
         --argjson installation_id "$INSTALLATION_ID_JSON" \
         --argjson capabilities "$CAPABILITIES_JSON" \
         --argjson tx_bytes "$TX_BYTES" \
@@ -902,7 +920,7 @@ while true; do
         '{endpoint:$endpoint, installation_id:$installation_id, capabilities:$capabilities,
           host_lan_ip:$host_lan_ip, tx_bytes:$tx_bytes, rx_bytes:$rx_bytes,
           peers:$peers, route_all_active:$route_all_active, upstream_exit_health:$upstream_exit_health,
-          telemetry:$telemetry}')
+          telemetry:$telemetry, connector_version:$connector_version}')
 
     CURL_ARGS=( -sf -X POST -H "Content-Type: application/json" )
     [[ -n "$DEVICE_SECRET" ]] && CURL_ARGS+=( -H "X-Device-Secret: $DEVICE_SECRET" )

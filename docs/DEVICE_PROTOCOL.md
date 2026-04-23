@@ -3,7 +3,24 @@
 **Status:** v1 (current behavior) documented + frozen. v2 (formal,
 versioned, device-auth) phased rollout in progress.
 **Owner:** Scott
-**Last revised:** 2026-04-10
+**Last revised:** 2026-04-23
+
+## Update 2026-04-23
+
+- Every shell connector + macOS/Windows/Android native app now sends
+  an optional `connector_version` string on each heartbeat / v2 state
+  report. Stored on `nodes.connector_version`; surfaced in the portal
+  so operators can see out-of-date installs at a glance. See the v1
+  heartbeat body + v2 state-report fields below.
+- Enrollment tokens now support `target_device_id` for portal-driven
+  re-enrollment. When present, `enroll_node` takes an UPDATE path on
+  the existing `nodes` row (rotating `public_key` + `device_secret`,
+  bumping `config_version`, preserving `overlay_ip` and lifetime
+  tx/rx counters). If absent or the referenced device is gone, the
+  brain falls through to the existing INSERT path. See the
+  "Re-enroll flow" subsection below, and
+  [ROADBLOCKS.md §15 "2026-04-23 — Re-enroll was creating a new
+  node"](ROADBLOCKS.md) for the incident that motivated it.
 
 This doc is the **single source of truth** for everything on the wire
 between a wg0 client device and the brain. If you're building a new
@@ -118,6 +135,19 @@ fan-out remains capability-gated until each client family catches up.**
 - **Revoke mid-session.** If a subsequent desired-state response omits
   a previously-active membership, tear down its route table before
   its peer entries, to avoid a brief "traffic to dead tunnel" window.
+- **Re-enroll of an existing node (shipped 2026-04-23).** Portal-driven
+  recovery (app reinstall, lost device_secret, debug-keystore drift)
+  mints a single-use token with `target_device_id` pointing at the
+  row being repaired. Brain records the target on
+  `enrollment_tokens.target_device_id`. On redemption, `enroll_node`
+  branches: if `target_device_id` is set AND resolves, the existing
+  `nodes` row is updated in place — same `node_id`, same
+  `overlay_ip`, rotated `public_key` + `device_secret`, bumped
+  `config_version`. If the token's `target_device_id` is unset or the
+  target has been deleted, the brain falls through to the existing
+  fresh-enroll INSERT path. This is invisible to the shell connectors;
+  it matters for portal UX and for the native apps that wipe their
+  SecureStorage on reinstall.
 
 Per-connector parity status and milestone plan live in
 [CONNECTOR_MULTINETWORK_ROADMAP.md](CONNECTOR_MULTINETWORK_ROADMAP.md).
@@ -150,6 +180,7 @@ Cross-account sharing protocol is in
   "endpoint": "24.127.208.189:51820",
   "tx_bytes": 1296354032,
   "rx_bytes": 35799372,
+  "connector_version": "linux-shell-0.4.1",
   "peers": [
     {
       "public_key": "i9/OVfl7lrZjA00ANfjjeIoPuIDEMa/yGLH7+mYWDgA=",
@@ -164,6 +195,11 @@ Cross-account sharing protocol is in
 All fields optional **except `endpoint`** is expected for same-LAN
 detection to work. `peers[]` was added in PR2 and is optional; old
 connectors omit it and the brain accepts the omission.
+`connector_version` was added 2026-04-22; it's a short identifier
+like `linux-shell-0.4.1`, `macos-native-0.2.4`, `windows-native-gg`,
+or `android-native-alpha19`. Missing = unknown (old connector). It's
+stored on `nodes.connector_version` and drives the portal's "Update
+available" pill.
 
 ### Heartbeat response (v1)
 
@@ -368,6 +404,7 @@ The v2 heartbeat body fully specifies what the device currently sees:
   "protocol_version": 2,
   "device_kind": "managed",
   "capabilities": ["same_lan_detection", "split_tunnel_macos", "peer_observations"],
+  "connector_version": "macos-native-0.2.4",
   "current_state": {
     "endpoint_observed_local": "24.127.208.189:51820",
     "wg_interface": "wg0",
@@ -384,6 +421,10 @@ The v2 heartbeat body fully specifies what the device currently sees:
   }
 }
 ```
+
+`connector_version` is an optional top-level string (added
+2026-04-22). Same semantics as the v1 field — see above. Brain
+behavior is identical for v1 and v2 reports.
 
 ### Errors
 

@@ -31,6 +31,13 @@ export class Wg0Client {
     return this.config.apiKey;
   }
 
+  /** Base brain URL, trailing slash trimmed — used by tools that need
+   *  to mint a managed-enrollment URI (`wg0://enroll?token=…&base=…`)
+   *  from a minted token. */
+  getBrainUrl(): string {
+    return this.config.brainUrl.replace(/\/$/, "");
+  }
+
   private headers(): Record<string, string> {
     return {
       Authorization: `Bearer ${this.config.apiKey}`,

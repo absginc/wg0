@@ -137,13 +137,14 @@ const PROMPTS = [
   {
     name: "provision_mobile_device",
     description:
-      "Server-side keygen + enroll a mobile device, then render the wg_config for QR.",
+      "Enroll a mobile device. Prefers the wg0 native app path (managed URI, device-generated keypair); falls back to the stock-WireGuard QR if the user can't install the wg0 app.",
     arguments: [
       { name: "network_name", description: "Name of the network.", required: true },
       { name: "device_name", description: "Friendly device name.", required: true },
+      { name: "app_flavor", description: "'wg0-native' (default, preferred — uses Android alpha18+ / iOS tbd) or 'stock-wireguard' (for users on the App Store / Play Store WireGuard app with no wg0 install).", required: false },
     ],
     template:
-      "I want to provision a new mobile device named {device_name} into the network {network_name}. Use list_networks to find the network_id, then call provision_device with os_type='android' and role='client'. Return the wg_config text so I can pipe it into qrencode.",
+      "I want to provision a new mobile device named {device_name} into the network {network_name} (app_flavor={app_flavor}, default 'wg0-native'). Use list_networks to find the network_id. For 'wg0-native': call generate_enrollment_token with that network_id, then show me the returned `managed_enroll_uri` so I can render it as a QR for the wg0 Android / iOS app to scan. For 'stock-wireguard': call provision_device with os_type matching the device + role='client' and return the wg_config text so I can pipe it into qrencode. Tell me which path was chosen + why. Do not use provision_device when the user has the wg0 native app — it embeds a private key the user doesn't need to handle.",
   },
   {
     name: "activate_byo_exit",

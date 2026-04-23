@@ -400,6 +400,25 @@ cmd_status() {
     if [[ "${WG_ACCESS:-ok}" == "needs sudo" ]]; then
         printf '  %s\n' "$(dim "Tip: run 'sudo wg0 status' on macOS for live WireGuard peer details.")"
     fi
+
+    # LAN-placement diagnostic: show which routes point at the wg
+    # tunnel iface. If you expect a /24 to route through wg0 (LAN
+    # placement) but it's not here, something else is stealing the
+    # route (direct physical, VPN, etc.).
+    if [[ -n "${iface_display:-}" ]]; then
+        local real_iface="${iface_display#wg0 → }"
+        real_iface="${real_iface%% *}"
+        [[ -z "$real_iface" ]] && real_iface="$iface_display"
+        local route_lines=""
+        if [[ "$OS" == "Darwin" ]]; then
+            route_lines=$(netstat -rn -f inet 2>/dev/null | awk -v iface="$real_iface" '$NF == iface && $1 ~ /^[0-9]/ { print $1 }' | head -6)
+        else
+            route_lines=$(ip -4 route show dev "$real_iface" 2>/dev/null | awk '{print $1}' | head -6)
+        fi
+        if [[ -n "$route_lines" ]]; then
+            printf '  %-12s %s\n' "Tunnel routes" "$(echo "$route_lines" | paste -sd ', ' -)"
+        fi
+    fi
     printf '\n'
 
     printf '%s' "$(bold "Peers (${peer_count})")"; printf '\n'
