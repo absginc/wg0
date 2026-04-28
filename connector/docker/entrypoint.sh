@@ -25,7 +25,7 @@ BRAIN_URL="${BRAIN_URL%/}"
 # Connector version. Bumped per release of the container image — the
 # heartbeat carries this so the portal can flag nodes running a stale
 # image.
-CONNECTOR_VERSION="2026.04.22-b"
+CONNECTOR_VERSION="2026.04.27-e"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/wg0.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -813,32 +813,34 @@ while true; do
     fi
 
     # ── Config drift detection ──
+    # Fetch on every heartbeat (not just version-bump) so peer
+    # endpoint flips from relay/discover/direct land in /etc/wireguard/wg0.conf.
+    # cmp gates the actual syncconf so we don't thrash the kernel
+    # when bytes are unchanged.
     REMOTE_CV=$(echo "$RESPONSE" | jq -r '.config_version // 0')
-    LOCAL_CV=$(cat "$CONFIG_VERSION_FILE" 2>/dev/null || echo 0)
-
-    if [[ "$REMOTE_CV" -gt "$LOCAL_CV" ]]; then
-        CFG_ARGS=( -sf )
-        [[ -n "$DEVICE_SECRET" ]] && CFG_ARGS+=( -H "X-Device-Secret: $DEVICE_SECRET" )
-        NEW_CFG_JSON=$(curl "${CFG_ARGS[@]}" \
-            "${BRAIN_URL}/api/v1/nodes/${NODE_ID}/config" 2>/dev/null || true)
-
-        if [[ -n "$NEW_CFG_JSON" ]]; then
-            NEW_WG=$(echo "$NEW_CFG_JSON" | jq -r '.wg_config // empty')
-            if [[ -n "$NEW_WG" ]]; then
-                TMP_CONF=$(mktemp)
-                echo "$NEW_WG" \
-                    | sed "s|# PrivateKey = <CONNECTOR_FILLS_THIS_IN>|PrivateKey = ${PRIV_KEY}|" \
-                    > "$TMP_CONF"
-                chmod 600 "$TMP_CONF"
+    CFG_ARGS=( -sf )
+    [[ -n "$DEVICE_SECRET" ]] && CFG_ARGS+=( -H "X-Device-Secret: $DEVICE_SECRET" )
+    NEW_CFG_JSON=$(curl "${CFG_ARGS[@]}" \
+        "${BRAIN_URL}/api/v1/nodes/${NODE_ID}/config" 2>/dev/null || true)
+    if [[ -n "$NEW_CFG_JSON" ]]; then
+        NEW_WG=$(echo "$NEW_CFG_JSON" | jq -r '.wg_config // empty')
+        if [[ -n "$NEW_WG" ]]; then
+            TMP_CONF=$(mktemp)
+            echo "$NEW_WG" \
+                | sed "s|# PrivateKey = <CONNECTOR_FILLS_THIS_IN>|PrivateKey = ${PRIV_KEY}|" \
+                > "$TMP_CONF"
+            chmod 600 "$TMP_CONF"
+            if ! cmp -s "$TMP_CONF" "$WG_CONF" 2>/dev/null; then
                 mv -f "$TMP_CONF" "$WG_CONF"
-                # Re-run the container sanitization on the fresh config so a
-                # later docker stop/restart doesn't execute the raw brain-
-                # rendered PostUp/PreDown (which would fail or hijack routes).
+                # Re-run container sanitization on the fresh config so a
+                # later docker stop/restart doesn't execute raw PostUp/PreDown.
                 sanitize_wg_conf
                 wg syncconf ${WG_IFACE} <(wg-quick strip "$WG_CONF") 2>/dev/null || true
-                echo "$REMOTE_CV" > "$CONFIG_VERSION_FILE"
-                log "Config updated to version ${REMOTE_CV}."
+                log "Config converged to version ${REMOTE_CV}."
+            else
+                rm -f "$TMP_CONF"
             fi
+            echo "$REMOTE_CV" > "$CONFIG_VERSION_FILE"
         fi
     fi
 

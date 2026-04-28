@@ -19,10 +19,10 @@ info:
     See the companion documents for context:
 
     * [README](https://github.com/absginc/wg0/blob/main/README.md)
+    * [API guide](https://wg0.io/API.md)
     * [DEVICE_PROTOCOL.md](https://github.com/absginc/wg0/blob/main/docs/DEVICE_PROTOCOL.md)
     * [BYO_EXIT.md](https://github.com/absginc/wg0/blob/main/docs/BYO_EXIT.md)
-    * [TESTING_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/TESTING_ROADMAP.md)
-    * [ROADBLOCKS.md](https://github.com/absginc/wg0/blob/main/docs/ROADBLOCKS.md)
+    * [MCP.md](https://github.com/absginc/wg0/blob/main/docs/MCP.md)
 
     ## Versioning
 
@@ -675,7 +675,8 @@ paths:
         Tokens are used by the shell connector's `enroll` subcommand and
         by any other agent that supplies its own WireGuard public key.
         Single-use by default; pass `is_reusable: true` for a long-lived
-        MSP provisioning token.
+        MSP provisioning token. Use `expires_hours` to set a relative
+        expiry; use `target_device_id` for row-bound re-enroll tokens.
       security:
         - bearerAuth: []
       requestBody:
@@ -2240,7 +2241,11 @@ components:
       properties:
         network_id: { type: string, format: uuid }
         is_reusable: { type: boolean, default: false }
-        expires_at: { type: string, format: date-time, nullable: true }
+        expires_hours:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Hours until expiry. Omit or null for no auto-expiry.
         target_device_id:
           type: string
           format: uuid

@@ -24,12 +24,20 @@ export function enrollmentTools(client: Wg0Client): Tool[] {
       inputSchema: z.object({
         network_id: z.string().uuid(),
         is_reusable: z.boolean().default(false),
-        expires_at: z
-          .string()
-          .datetime()
+        expires_hours: z
+          .number()
+          .int()
+          .positive()
           .optional()
           .describe(
-            "ISO-8601 UTC. Omit for a token that doesn't auto-expire.",
+            "Hours until expiry. Omit for a token that doesn't auto-expire.",
+          ),
+        target_device_id: z
+          .string()
+          .uuid()
+          .optional()
+          .describe(
+            "Optional existing device id for row-bound re-enroll flows. When set, redemption rotates the existing membership instead of allocating a fresh overlay IP.",
           ),
       }),
       handler: async (args) => {

@@ -91,7 +91,7 @@ These are real system components but not part of the public customer OpenAPI:
 Read `ROADBLOCKS.md` before making hard claims about any of the following:
 
 - Full managed Windows parity with Linux/macOS shell/native behavior
-- Full managed mobile client parity
+- Full managed mobile client parity beyond the Android alpha currently under physical-device testing
 - General-purpose multi-membership runtime on every connector family
 - Fine-grained PAT scopes
 - Multi-user service accounts
@@ -102,14 +102,11 @@ Read `ROADBLOCKS.md` before making hard claims about any of the following:
 - [README.md](https://github.com/absginc/wg0/blob/main/README.md)
 - [API.md](https://wg0.io/API.md)
 - [DEVICE_PROTOCOL.md](https://github.com/absginc/wg0/blob/main/docs/DEVICE_PROTOCOL.md)
-- [MULTI_NETWORK_INSTALLATION_PLAN.md](https://github.com/absginc/wg0/blob/main/docs/MULTI_NETWORK_INSTALLATION_PLAN.md) — canonical multi-network data model + UX rules
-- [SHARED_NETWORK_INVITES.md](https://github.com/absginc/wg0/blob/main/docs/SHARED_NETWORK_INVITES.md) — cross-account sharing protocol
-- [CONNECTOR_MULTINETWORK_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/CONNECTOR_MULTINETWORK_ROADMAP.md) — per-connector parity status + milestones
-- [SITE_ACCESS_DESIGN.md](https://github.com/absginc/wg0/blob/main/docs/SITE_ACCESS_DESIGN.md) — gateway exports + access grants
 - [BYO_EXIT.md](https://github.com/absginc/wg0/blob/main/docs/BYO_EXIT.md)
-- [ANDROID_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/ANDROID_ROADMAP.md) — native Android app status
-- [WINDOWS_NATIVE_PLAN.md](https://github.com/absginc/wg0/blob/main/docs/WINDOWS_NATIVE_PLAN.md) — native Windows app scope
-- [MACOS_DIAGNOSTICS_AND_RECOVERY_PLAN.md](https://github.com/absginc/wg0/blob/main/docs/MACOS_DIAGNOSTICS_AND_RECOVERY_PLAN.md) — native macOS app status
 - [MCP.md](https://github.com/absginc/wg0/blob/main/docs/MCP.md) — MCP server install + tool list
-- [TESTING_ROADMAP.md](https://github.com/absginc/wg0/blob/main/docs/TESTING_ROADMAP.md)
-- [ROADBLOCKS.md](https://github.com/absginc/wg0/blob/main/docs/ROADBLOCKS.md)
+- [Public use cases](https://github.com/absginc/wg0/tree/main/docs/usecases)
+
+Private operator docs in the source repo cover the multi-network
+installation model, shared-network rollout, native-client roadmaps,
+testing roadmap, and current roadblocks. They intentionally do not
+ship in the public mirror.

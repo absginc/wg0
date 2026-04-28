@@ -240,7 +240,7 @@ admin) is tracked as follow-up. If that's a blocker for you,
 tell us and we'll prioritize it."
 
 **Follow-up if they ask about the MCP server:** "Stdio
-transport, 16 tools, 3 resources, 4 prompts. Works with Claude
+transport, 42 tools, 3 resources, 4 prompts. Works with Claude
 Desktop, Claude Code, Cursor, and anything else that speaks
 MCP stdio. It's a TypeScript project; clone the repo, `npm
 install`, `npm run build`, point Claude Desktop at

@@ -26,9 +26,10 @@ no long-lived browser sessions.
 ## Prerequisites
 
 1. A wg0 account at https://login.wg0.io.
-2. A personal access token minted via `POST /api/v1/api-keys` —
-   your dashboard will have a management UI once that lands, in the
-   meantime use `curl` per [docs/API.md](https://wg0.io/API.md#6-mint-a-pat-and-use-it-for-automation).
+2. A personal access token minted from the dashboard's **API keys**
+   page or via `POST /api/v1/api-keys`. Use `curl` per
+   [docs/API.md](https://wg0.io/API.md#6-mint-a-pat-and-use-it-for-automation)
+   when automating.
 3. Node.js 18+ on whatever machine runs your agent.
 
 ## Install
@@ -68,7 +69,7 @@ Add this under `mcpServers`:
 ```
 
 Restart Claude Desktop. You should see "wg0" under the MCP servers
-badge in the chat input. The server will expose ~15 tools, 3
+badge in the chat input. The server will expose 42 tools, 3
 documentation resources, and 4 task-starter prompts.
 
 ## Tools
@@ -91,6 +92,11 @@ documentation resources, and 4 task-starter prompts.
 | `deactivate_upstream_exit` | Revert the host to physical WAN |
 | `get_node_traffic` | Hourly TX/RX buckets for a single node |
 | `get_network_traffic` | Aggregated hourly TX/RX for an entire network |
+
+The full current tool surface also includes managed-device inventory,
+device membership attach/detach, shared-network access, and site-access
+gateway exports/grants. Keep [docs/MCP.md](../docs/MCP.md) as the
+canonical list because it is updated alongside tool additions.
 
 ## Resources
 
@@ -115,9 +121,8 @@ Starter prompts for common workflows:
 This MCP server is a thin wrapper around the wg0 brain API. It does
 NOT do its own authentication, authorization, or rate limiting —
 every request is made as your PAT, which has the same authority as
-your JWT (full-account access). See
-[docs/ROADBLOCKS.md §9](https://github.com/absginc/wg0/blob/main/docs/ROADBLOCKS.md)
-for the fine-grained scope enforcement roadmap.
+your JWT (full-account access). Fine-grained PAT scopes are still a
+roadmap item; until then, treat each PAT as account-wide authority.
 
 Until scopes are enforced:
 

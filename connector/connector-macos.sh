@@ -27,7 +27,7 @@ set -euo pipefail
 # Connector version. Bumped each time this script changes in a way
 # users need to redeploy — heartbeat carries this so the portal can
 # show an "update available" badge.
-CONNECTOR_VERSION="2026.04.22-b"
+CONNECTOR_VERSION="2026.04.27-e"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -139,6 +139,16 @@ resolve_wg_real() {
 # Every wg/route call must use the real utun name, not the logical alias.
 WG_REAL=\$(resolve_wg_real || true)
 [[ -z "\$WG_REAL" ]] && WG_REAL="${WG_IFACE}"
+
+# Revoked-node short-circuit (NEXT_STEPS #7C). When the brain returned
+# 404 "Node revoked" on a previous cycle we dropped this marker file
+# and tore the tunnel down. Every subsequent launchd tickle should be
+# a no-op silent exit; the watchdog will keep re-launching us, and
+# every relaunch finds the same marker and exits fast. Clearing the
+# marker is an operator action (\`unenroll\` / \`enroll\` / \`update\`).
+if [[ -f "${KEY_DIR}/revoked" ]]; then
+    exit 0
+fi
 
 # If wireguard-go is not running, skip — the watchdog will restart it.
 "\$WG_BIN" show "\$WG_REAL" >/dev/null 2>&1 || exit 0
@@ -358,14 +368,53 @@ HB_BODY=\$(jq -cn \\
 
 CURL_ARGS=( -sf -X POST -H "Content-Type: application/json" )
 [[ -n "\$DEVICE_SECRET" ]] && CURL_ARGS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
-RESPONSE=\$(curl "\${CURL_ARGS[@]}" \\
+# Capture the HTTP status code so we can classify 404 "Node revoked"
+# distinctly from transient 5xx/network failures. -w "%{http_code}"
+# gets written after the body; we split on the last 3 chars.
+HB_OUT=\$(curl -sS -w "\\n__hb_http_status__%{http_code}" \\
+    -X POST -H "Content-Type: application/json" \\
+    \$([[ -n "\$DEVICE_SECRET" ]] && echo "-H X-Device-Secret:\$DEVICE_SECRET") \\
     -d "\$HB_BODY" \\
-    "${BRAIN_URL}/api/v1/nodes/\${NODE_ID}/heartbeat" 2>/dev/null) || {
-        if [[ "\${WG0_HEARTBEAT_STRICT:-0}" == "1" ]]; then
-            exit 1
-        fi
+    "${BRAIN_URL}/api/v1/nodes/\${NODE_ID}/heartbeat" 2>/dev/null || true)
+HB_STATUS=\$(echo "\$HB_OUT" | awk -F'__hb_http_status__' 'END{print \$2}' | tr -d '[:space:]')
+RESPONSE=\$(echo "\$HB_OUT" | awk -F'__hb_http_status__' '{print \$1}' | sed '\$d')
+
+# Node-deletion tear-down (ROADBLOCKS §15 2026-04-24, NEXT_STEPS #7).
+# When the operator deletes a node in the portal (or another node
+# pushes us out), the brain now returns 404 with detail "Node revoked"
+# from the heartbeat endpoint. Before this branch, curl -sf swallowed
+# the response, we exited 0 quietly, and the tunnel lingered as a
+# zombie until the app was manually killed. Now: classify 404 +
+# revoked/not found detail as terminal, tear down the tunnel, and
+# drop a \$KEY_DIR/revoked marker so subsequent launchd tickles
+# (including the watchdog) exit fast without heartbeating.
+if [[ "\$HB_STATUS" == "404" ]]; then
+    DETAIL=\$(echo "\$RESPONSE" | jq -r '.detail // .error // ""' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if echo "\$DETAIL" | grep -qE 'revoked|not found|node not found'; then
+        echo "[wg0 \$(date -u +%H:%M:%SZ)] brain returned 404 '\$DETAIL' — node revoked. Tearing down tunnel." >&2
+        echo "\$DETAIL" > "${KEY_DIR}/revoked" 2>/dev/null || true
+        "\$WG_QUICK_BIN" down "${WG_CONF}" 2>/dev/null || true
+        # Also drop stale launchd sockets so the watchdog's next kick
+        # observes the revoked marker and exits cleanly.
+        rm -f /var/run/wireguard/${WG_IFACE}.* 2>/dev/null || true
+        echo "[wg0 \$(date -u +%H:%M:%SZ)] to reconnect: remove \${KEY_DIR}/revoked and re-enroll via '\$0 enroll <TOKEN> <BRAIN_URL>'" >&2
         exit 0
-    }
+    fi
+fi
+if [[ -z "\$HB_STATUS" || "\$HB_STATUS" -ge 400 ]]; then
+    if [[ "\${WG0_HEARTBEAT_STRICT:-0}" == "1" ]]; then
+        exit 1
+    fi
+    exit 0
+fi
+
+# Successful heartbeat: stamp a marker file so \`wg0 status\` can report
+# Last beat accurately. The launchd-appended log file only grows when
+# the script writes to stdout/stderr, which almost never happens on
+# the happy path — so relying on its mtime gives stale readings (the
+# "25h ago" cosmetic bug). Touch a dedicated marker every cycle, then
+# wg0-status prefers it over the log mtime.
+touch "${KEY_DIR}/last_heartbeat" 2>/dev/null || true
 
 if [[ "\$(echo "\$RESPONSE" | jq -r '.collect_device_telemetry // false' 2>/dev/null)" == "true" ]]; then
     echo "on" > "\$COLLECT_TELEMETRY_STATE"
@@ -374,65 +423,307 @@ else
 fi
 
 # ── Config drift detection (device protocol v2) ──────────────────────────
-# Heartbeat response carries \`config_version\`. If the brain advertises a
-# newer version than the one we have on disk, fetch the full wg_config,
-# substitute the local private key, and \`wg syncconf\` the utun interface.
+# Every heartbeat we GET the brain's rendered wg_config and check it
+# against what's on disk. If different, rewrite the file AND wg
+# syncconf. If identical, no-op — cheap.
+#
+# Why every heartbeat (not just on config_version bump): the brain
+# returns peer Endpoint values that change with relay/discover/direct
+# transitions which DO NOT bump config_version. Pre-2026.04.27, that
+# meant /etc/wireguard/wg0.conf grew stale on disk while the live
+# kernel state was kept fresh by the per-peer \`wg set\` calls earlier
+# in this loop. After a reboot, wg-quick read the stale file and
+# brought up peers with old endpoints — Scott saw a peer endpoint of
+# 24.127.208.189:1111 (a months-old NAT-mapped port) hanging around
+# until the next config_version bump. Now the file matches live
+# state.
 REMOTE_CONFIG_VERSION=\$(echo "\$RESPONSE" | jq -r '.config_version // 0')
-LOCAL_CONFIG_VERSION=\$(cat "${CONFIG_VERSION_FILE}" 2>/dev/null || echo 0)
-if [[ "\$REMOTE_CONFIG_VERSION" -gt "\$LOCAL_CONFIG_VERSION" ]]; then
-    CONFIG_CURL_ARGS=( -sf )
-    [[ -n "\$DEVICE_SECRET" ]] && CONFIG_CURL_ARGS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
-    NEW_CFG_JSON=\$(curl "\${CONFIG_CURL_ARGS[@]}" \\
-        "${BRAIN_URL}/api/v1/nodes/\${NODE_ID}/config" 2>/dev/null || true)
-    if [[ -n "\$NEW_CFG_JSON" ]]; then
-        NEW_WG_CONFIG=\$(echo "\$NEW_CFG_JSON" | jq -r '.wg_config // empty')
-        if [[ -n "\$NEW_WG_CONFIG" && -f "${PRIV_KEY_FILE}" ]]; then
-            PRIV_KEY_VALUE=\$(cat "${PRIV_KEY_FILE}")
-            TMP_CONF=\$(mktemp)
-            echo "\$NEW_WG_CONFIG" \\
-                | sed "s|# PrivateKey = <CONNECTOR_FILLS_THIS_IN>|PrivateKey = \${PRIV_KEY_VALUE}|" \\
-                > "\$TMP_CONF"
-            chmod 600 "\$TMP_CONF"
+CONFIG_CURL_ARGS=( -sf )
+[[ -n "\$DEVICE_SECRET" ]] && CONFIG_CURL_ARGS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
+NEW_CFG_JSON=\$(curl "\${CONFIG_CURL_ARGS[@]}" \\
+    "${BRAIN_URL}/api/v1/nodes/\${NODE_ID}/config" 2>/dev/null || true)
+if [[ -n "\$NEW_CFG_JSON" ]]; then
+    NEW_WG_CONFIG=\$(echo "\$NEW_CFG_JSON" | jq -r '.wg_config // empty')
+    if [[ -n "\$NEW_WG_CONFIG" && -f "${PRIV_KEY_FILE}" ]]; then
+        PRIV_KEY_VALUE=\$(cat "${PRIV_KEY_FILE}")
+        TMP_CONF=\$(mktemp)
+        echo "\$NEW_WG_CONFIG" \\
+            | sed "s|# PrivateKey = <CONNECTOR_FILLS_THIS_IN>|PrivateKey = \${PRIV_KEY_VALUE}|" \\
+            > "\$TMP_CONF"
+        chmod 600 "\$TMP_CONF"
+        # Compare-and-swap: only syncconf when something actually
+        # changed. cmp returns 0 on identical. Avoid pointless
+        # syncconf calls that thrash the kernel state on every
+        # heartbeat when the brain returns the same bytes.
+        if ! cmp -s "\$TMP_CONF" "${WG_CONF}" 2>/dev/null; then
             mv -f "\$TMP_CONF" "${WG_CONF}"
-            # macOS: wg syncconf targets the utun device, not the
-            # logical wg0 alias. wg-quick strip is the same on macOS.
             "\$WG_BIN" syncconf "\$WG_REAL" <("\$WG_QUICK_BIN" strip "${WG_CONF}") 2>/dev/null || true
-            echo "\$REMOTE_CONFIG_VERSION" > "${CONFIG_VERSION_FILE}"
-            chmod 600 "${CONFIG_VERSION_FILE}"
+        else
+            rm -f "\$TMP_CONF"
         fi
+        echo "\$REMOTE_CONFIG_VERSION" > "${CONFIG_VERSION_FILE}"
+        chmod 600 "${CONFIG_VERSION_FILE}"
     fi
 fi
 
 # Our own overlay /32 for use in same-LAN aliasing below.
 OVERLAY_IP=\$(cat "\$OVERLAY_IP_FILE" 2>/dev/null | tr -d '[:space:]')
 
+# route_log: low-volume WARN line visible via \`log show\` / launchd stderr
+# when a route operation fails unexpectedly. Silent 2>/dev/null on
+# \`route\` calls is what let Scott's Mac lose its /24 for a full day
+# before anyone noticed — every install failure now leaves breadcrumbs.
+route_log() {
+    echo "[wg0-route \$(date -u +%H:%M:%SZ)] \$*" >&2
+}
+
 # add_peer_route: idempotently install a kernel route for one CIDR.
 # macOS does not have \`ip route replace\`, so we delete-then-add. The brief
 # gap is harmless because heartbeats run every 30s and pings retry.
+# Callers must not rely on an on-disk cache to decide whether to call
+# this — add_peer_route is the authoritative "this route must exist on
+# \$iface" gate, and it runs every heartbeat for every desired CIDR.
 add_peer_route() {
     local cidr="\$1"
     local iface="\$2"
     local ip="\${cidr%/*}"
     local prefix="\${cidr#*/}"
+    local rc err
     [[ -z "\$ip" || -z "\$prefix" ]] && return
-    if [[ "\$prefix" == "32" ]]; then
-        route -nq delete -host "\$ip" 2>/dev/null
-        route -nq add -host "\$ip" -interface "\$iface" 2>/dev/null
-    else
-        route -nq delete -net "\$cidr" 2>/dev/null
-        route -nq add -net "\$cidr" -interface "\$iface" 2>/dev/null
+    # Physical-iface guard: if a non-utun interface already owns this
+    # prefix (typical case: we just landed on the LAN that the tunnel
+    # was reaching), refuse to install a tunnel route for the same
+    # prefix. Brain's on_same_lan signal already suppresses this in the
+    # peers loop; the guard catches race windows + brain bugs.
+    if ! phys_iface_allows_tunnel_cidr "\$cidr" "\$iface"; then
+        route_log "skip add \$cidr on \$iface: physical interface already owns this prefix"
+        return 0
     fi
+    if [[ "\$prefix" == "32" ]]; then
+        route -nq delete -host "\$ip" >/dev/null 2>&1
+        err=\$(route -nq add -host "\$ip" -interface "\$iface" 2>&1); rc=\$?
+    else
+        route -nq delete -net "\$cidr" >/dev/null 2>&1
+        err=\$(route -nq add -net "\$cidr" -interface "\$iface" 2>&1); rc=\$?
+    fi
+    if [[ "\$rc" != "0" ]]; then
+        # "File exists" = kernel already has a route with the same
+        # destination on some iface. Try an iface-scoped delete and
+        # retry once — this handles the case where a ghost utunN route
+        # from a previous tunnel lingers and blocks us.
+        if echo "\$err" | grep -qi 'file exists\\|route already in table'; then
+            route -nq delete "\$cidr" >/dev/null 2>&1 || true
+            if [[ "\$prefix" == "32" ]]; then
+                err=\$(route -nq add -host "\$ip" -interface "\$iface" 2>&1); rc=\$?
+            else
+                err=\$(route -nq add -net "\$cidr" -interface "\$iface" 2>&1); rc=\$?
+            fi
+        fi
+    fi
+    if [[ "\$rc" != "0" ]]; then
+        route_log "add \$cidr via \$iface failed (rc=\$rc): \${err:-no stderr}"
+        return 1
+    fi
+    return 0
 }
 
 del_peer_route() {
     local cidr="\$1"
     local ip="\${cidr%/*}"
     local prefix="\${cidr#*/}"
+    local err rc
     [[ -z "\$ip" || -z "\$prefix" ]] && return
     if [[ "\$prefix" == "32" ]]; then
-        route -nq delete -host "\$ip" 2>/dev/null
+        err=\$(route -nq delete -host "\$ip" 2>&1); rc=\$?
     else
-        route -nq delete -net "\$cidr" 2>/dev/null
+        err=\$(route -nq delete -net "\$cidr" 2>&1); rc=\$?
+    fi
+    # "not in table" is the expected no-op case; only log real failures.
+    if [[ "\$rc" != "0" ]] && ! echo "\$err" | grep -qi 'not in table\\|no such process'; then
+        route_log "delete \$cidr failed (rc=\$rc): \${err:-no stderr}"
+    fi
+}
+
+# phys_iface_allows_tunnel_cidr: return 0 (yes, install the tunnel
+# route) iff no non-tunnel interface already owns \$cidr. Protects
+# against the roaming case where Scott lands back on the MTMORRIS LAN
+# and his en0 DHCPs a real 10.0.0.0/24 route — we must not then slap
+# a /24 tunnel route on top that steals packets destined for the
+# physical gateway. Returns 0 for any single-host (/32) CIDR since
+# /32 tunnel routes for peers never conflict with a /24 on the LAN.
+phys_iface_allows_tunnel_cidr() {
+    local cidr="\$1" tun_iface="\$2" prefix
+    prefix="\${cidr#*/}"
+    [[ "\$prefix" == "32" ]] && return 0
+    # Look up the current effective iface for the CIDR's network. If
+    # netstat can resolve it and the returning iface is not a utun*
+    # (and not our own tunnel), the LAN claims this prefix already.
+    local existing
+    existing=\$(
+        netstat -rn -f inet 2>/dev/null \\
+            | awk -v want="\$cidr" '
+                {
+                    dest = \$1; iface = \$NF
+                    # Normalize abbreviated BSD CIDRs (e.g., "10/8",
+                    # "10.0.0/24") into full form so we can compare.
+                    split(dest, parts, "/")
+                    ip = parts[1]; pfx = parts[2]
+                    n = split(ip, oct, ".")
+                    while (n < 4) { oct[++n] = "0" }
+                    full = oct[1] "." oct[2] "." oct[3] "." oct[4]
+                    if (pfx == "") pfx = "32"
+                    norm = full "/" pfx
+                    if (norm == want) print iface
+                }
+            ' \\
+            | grep -v '^utun' \\
+            | head -n1
+    )
+    if [[ -n "\$existing" && "\$existing" != "\$tun_iface" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# kernel_routes_on_iface: emit one CIDR per line for routes currently
+# pointed at \$iface. BSD netstat abbreviates destinations (10/8,
+# 10.0.0/24) and prints bare host IPs without a prefix — we normalize
+# them back to full CIDR here so the caller can diff against the
+# heartbeat-advertised allowed_ips strings without surprises.
+kernel_routes_on_iface() {
+    local iface="\$1"
+    [[ -z "\$iface" ]] && return 0
+    netstat -rn -f inet 2>/dev/null | awk -v iface="\$iface" '
+        \$NF == iface {
+            dest = \$1
+            split(dest, parts, "/")
+            ip = parts[1]; pfx = parts[2]
+            n = split(ip, oct, ".")
+            while (n < 4) { oct[++n] = "0" }
+            full = oct[1] "." oct[2] "." oct[3] "." oct[4]
+            if (pfx == "") pfx = "32"
+            print full "/" pfx
+        }
+    ' | sort -u
+}
+
+# reconcile_iface_routes: shared kernel-truth reconciler used for both
+# the primary wg0 and every attached wgN iface. Takes:
+#   \$1 = real iface name (WG_REAL, or the utun name a wgN resolved to)
+#   \$2 = state dir (KEY_DIR for primary, /etc/wireguard/wgN for attached)
+#   \$3 = the full heartbeat RESPONSE JSON for this iface
+#   \$4 = this iface's own overlay IP (skip pruning its /32)
+#   \$5 = "primary" | "attached" — attached skips the on_same_lan suppression
+#         (attached memberships don't run the same-LAN state machine)
+#
+# Steps: apply wg peer updates, apply probe_peer endpoints, reconcile
+# system routes against kernel truth (always re-add every desired CIDR,
+# prune anything on the iface not in desired).
+reconcile_iface_routes() {
+    local real_iface="\$1" state_dir="\$2" response="\$3" overlay_ip="\$4" mode="\${5:-primary}"
+    [[ -z "\$real_iface" || -z "\$state_dir" || -z "\$response" ]] && return 0
+
+    mkdir -p "\$state_dir" 2>/dev/null || true
+    local installed_file="\${state_dir}/installed_routes"
+    local iface_file="\${state_dir}/installed_routes_iface"
+    local desired_file="\${installed_file}.new"
+    : > "\$desired_file"
+
+    local prev_disk_routes=""
+    [[ -f "\$installed_file" ]] && prev_disk_routes=\$(cat "\$installed_file")
+
+    # Per-peer: wg-set the allowed-ips/endpoint/keepalive and collect
+    # CIDRs into the desired set. Skip on_same_lan peers only for
+    # primary (attached memberships never run the same-LAN state
+    # machine, so brain's on_same_lan flag is advisory at best there).
+    echo "\$response" | jq -c '.peers[]' 2>/dev/null | while read -r peer; do
+        local pubkey allowed ep peer_same_lan
+        pubkey=\$(echo "\$peer" | jq -r '.public_key')
+        allowed=\$(echo "\$peer" | jq -r '.allowed_ips')
+        ep=\$(echo "\$peer" | jq -r '.endpoint // empty')
+        peer_same_lan=\$(echo "\$peer" | jq -r '.on_same_lan // false')
+        if [[ -n "\$ep" ]]; then
+            "\$WG_BIN" set "\$real_iface" peer "\$pubkey" allowed-ips "\$allowed" endpoint "\$ep" persistent-keepalive 25
+        else
+            "\$WG_BIN" set "\$real_iface" peer "\$pubkey" allowed-ips "\$allowed" persistent-keepalive 25
+        fi
+        if [[ "\$mode" == "primary" && "\$peer_same_lan" == "true" ]]; then
+            continue
+        fi
+        echo "\$allowed" | tr ',' '\\n' | tr -d ' ' | while read -r cidr; do
+            [[ -z "\$cidr" || "\$cidr" == "0.0.0.0/0" ]] && continue
+            echo "\$cidr" >> "\$desired_file"
+        done
+    done
+
+    echo "\$response" | jq -c '.probe_peers[]?' 2>/dev/null | while read -r peer; do
+        local pubkey ep keepalive
+        pubkey=\$(echo "\$peer" | jq -r '.public_key // empty')
+        ep=\$(echo "\$peer" | jq -r '.endpoint // empty')
+        keepalive=\$(echo "\$peer" | jq -r '.persistent_keepalive // 25')
+        [[ -z "\$pubkey" || -z "\$ep" ]] && continue
+        "\$WG_BIN" set "\$real_iface" peer "\$pubkey" endpoint "\$ep" persistent-keepalive "\$keepalive"
+    done
+
+    local own_cidr=""
+    [[ -n "\$overlay_ip" ]] && own_cidr="\${overlay_ip}/32"
+
+    if [[ -s "\$desired_file" ]]; then
+        sort -u "\$desired_file" > "\${desired_file}.sorted" 2>/dev/null || true
+        # Re-assert every desired CIDR every heartbeat. add_peer_route
+        # is delete-then-add, idempotent, and logs failures loudly.
+        while read -r new_cidr; do
+            [[ -z "\$new_cidr" ]] && continue
+            add_peer_route "\$new_cidr" "\$real_iface"
+        done < "\${desired_file}.sorted"
+        # Prune: routes actually on the iface (+ prev disk record as
+        # a safety net) that aren't in the desired set.
+        local kernel_on_iface
+        kernel_on_iface=\$(kernel_routes_on_iface "\$real_iface")
+        {
+            echo "\$kernel_on_iface"
+            echo "\$prev_disk_routes"
+        } | sort -u | while read -r candidate; do
+            [[ -z "\$candidate" ]] && continue
+            [[ -n "\$own_cidr" && "\$candidate" == "\$own_cidr" ]] && continue
+            if ! grep -qxF "\$candidate" "\${desired_file}.sorted" 2>/dev/null; then
+                del_peer_route "\$candidate"
+            fi
+        done
+        mv -f "\${desired_file}.sorted" "\$installed_file" 2>/dev/null || true
+        printf '%s' "\$real_iface" > "\$iface_file"
+        rm -f "\$desired_file" 2>/dev/null || true
+    else
+        local kernel_on_iface
+        kernel_on_iface=\$(kernel_routes_on_iface "\$real_iface")
+        {
+            echo "\$kernel_on_iface"
+            echo "\$prev_disk_routes"
+        } | sort -u | while read -r candidate; do
+            [[ -z "\$candidate" ]] && continue
+            [[ -n "\$own_cidr" && "\$candidate" == "\$own_cidr" ]] && continue
+            del_peer_route "\$candidate"
+        done
+        rm -f "\$installed_file" "\$iface_file" "\$desired_file" 2>/dev/null || true
+    fi
+
+    # Remove stale WireGuard peers: anything the kernel has that the
+    # brain no longer advertises (including probe_peers it's rotated
+    # out). Applies to both primary and attached.
+    local response_pubkeys wg_pubkeys
+    response_pubkeys=\$(
+        echo "\$response" \\
+            | jq -r '[(.peers[]?.public_key), (.probe_peers[]?.public_key)] | map(select(. != null and . != "")) | .[]' 2>/dev/null \\
+            | sort -u
+    )
+    wg_pubkeys=\$("\$WG_BIN" show "\$real_iface" peers 2>/dev/null | sort -u)
+    if [[ -n "\$wg_pubkeys" ]]; then
+        echo "\$wg_pubkeys" | while read -r wg_pk; do
+            [[ -z "\$wg_pk" ]] && continue
+            if ! echo "\$response_pubkeys" | grep -qxF "\$wg_pk"; then
+                "\$WG_BIN" set "\$real_iface" peer "\$wg_pk" remove 2>/dev/null || true
+            fi
+        done
     fi
 }
 
@@ -556,25 +847,38 @@ fi
 
 # ── Same-LAN state machine ─────────────────────────────────────────────────
 # State format: "on|<iface>|<overlay-ip>" when aliased, "off" otherwise.
+#
+# Ordering matters here: when transitioning IN (tunnel → on-LAN), we must
+# delete overlapping tunnel routes BEFORE bringing up the physical-iface
+# alias. Otherwise there's a window where both wg0 (/24 carried on the
+# relay peer) and en0 (/24 from DHCP) claim the same prefix, ARP lookups
+# race, and the physical default gateway becomes unreachable. When
+# transitioning OUT (on-LAN → tunnel), we remove the alias first and
+# let the normal reconcile block below reinstall routes on the tunnel.
 SAME_LAN_PREV=\$(cat "\$SAME_LAN_STATE" 2>/dev/null || echo "off")
 
 if [[ "\$ON_SAME_LAN" = "1" && -n "\$OVERLAY_IP" ]]; then
     read -r PHYS_IFACE _ < <(get_phys_default)
-    if [[ -n "\$PHYS_IFACE" && "\$SAME_LAN_PREV" != on* ]]; then
-        # Transition IN: alias overlay IP on the physical interface so
-        # LAN devices can ARP-resolve us at the overlay address.
-        # macOS uses "ifconfig <iface> alias <ip> <mask>".
-        ifconfig "\$PHYS_IFACE" alias "\$OVERLAY_IP" 255.255.255.255 2>/dev/null || true
-        echo "on|\${PHYS_IFACE}|\${OVERLAY_IP}" > "\$SAME_LAN_STATE"
-    fi
-    # Remove any stale tunnel routes we previously installed for the
-    # same-LAN peer's allowed_ips — physical LAN routing handles them.
+    # Step 1: tear down any tunnel routes overlapping the peer CIDRs
+    # we're about to suppress. Do this FIRST, before the alias, so a
+    # concurrent ARP request for the LAN gateway can't race into the
+    # tunnel. Iface-scoped delete only — never touch routes the user
+    # or another tool put there.
     for _c in \$SAME_LAN_PEER_CIDRS; do
         del_peer_route "\$_c"
     done
+    if [[ -n "\$PHYS_IFACE" && "\$SAME_LAN_PREV" != on* ]]; then
+        # Step 2: alias overlay IP on the physical interface so LAN
+        # devices can ARP-resolve us at the overlay address.
+        ifconfig "\$PHYS_IFACE" alias "\$OVERLAY_IP" 255.255.255.255 2>/dev/null || true
+        echo "on|\${PHYS_IFACE}|\${OVERLAY_IP}" > "\$SAME_LAN_STATE"
+    fi
 elif [[ "\$SAME_LAN_PREV" == on* ]]; then
-    # Transition OUT: remove alias. Per-peer loop below will reinstall
-    # normal tunnel routes for the host on the next heartbeat.
+    # Transition OUT: remove alias first so nothing on the LAN sees us
+    # double-claim our overlay IP. Per-peer loop below will reinstall
+    # normal tunnel routes on this cycle — kernel-truth reconcile
+    # doesn't skip re-adds so the /24 will come back without waiting
+    # for another heartbeat.
     IFS='|' read -r _ PREV_IFACE PREV_OVERLAY <<< "\$SAME_LAN_PREV"
     if [[ -n "\$PREV_IFACE" && -n "\$PREV_OVERLAY" ]]; then
         ifconfig "\$PREV_IFACE" -alias "\$PREV_OVERLAY" 2>/dev/null || true
@@ -641,109 +945,35 @@ fi
 # 0.0.0.0/0 handled above via split-tunnel; peers flagged on_same_lan skip
 # route installation entirely (LAN routing handles them).
 #
-# Stale route cleanup: track installed routes in a state file. On each
-# heartbeat, diff old vs new and remove routes no longer in the peer list.
-# This handles profile route policy changes (split→off, CIDR removal).
-
-INSTALLED_ROUTES_FILE="${KEY_DIR}/installed_routes"
-INSTALLED_ROUTES_IFACE_FILE="${KEY_DIR}/installed_routes_iface"
-PREV_ROUTES=""
-PREV_ROUTE_IFACE=\$(cat "\$INSTALLED_ROUTES_IFACE_FILE" 2>/dev/null || echo "")
-[[ -f "\$INSTALLED_ROUTES_FILE" ]] && PREV_ROUTES=\$(cat "\$INSTALLED_ROUTES_FILE")
-: > "\${INSTALLED_ROUTES_FILE}.new"
-
-if [[ -n "\$PREV_ROUTES" && -n "\$PREV_ROUTE_IFACE" && "\$PREV_ROUTE_IFACE" != "\$WG_REAL" ]]; then
-    echo "\$PREV_ROUTES" | while read -r old_cidr; do
-        [[ -z "\$old_cidr" ]] && continue
-        del_peer_route "\$old_cidr"
-    done
-    PREV_ROUTES=""
-fi
-
-echo "\$RESPONSE" | jq -c '.peers[]' 2>/dev/null | while read -r peer; do
-    PUBKEY=\$(echo "\$peer" | jq -r '.public_key')
-    ALLOWED=\$(echo "\$peer" | jq -r '.allowed_ips')
-    EP=\$(echo "\$peer" | jq -r '.endpoint // empty')
-    PEER_SAME_LAN=\$(echo "\$peer" | jq -r '.on_same_lan // false')
-    if [[ -n "\$EP" ]]; then
-        "\$WG_BIN" set "\$WG_REAL" peer "\$PUBKEY" allowed-ips "\$ALLOWED" endpoint "\$EP" persistent-keepalive 25
-    else
-        "\$WG_BIN" set "\$WG_REAL" peer "\$PUBKEY" allowed-ips "\$ALLOWED" persistent-keepalive 25
-    fi
-    [[ "\$PEER_SAME_LAN" == "true" ]] && continue
-    echo "\$ALLOWED" | tr ',' '\\n' | tr -d ' ' | while read -r cidr; do
-        [[ -z "\$cidr" || "\$cidr" == "0.0.0.0/0" ]] && continue
-        echo "\$cidr" >> "\${INSTALLED_ROUTES_FILE}.new"
-    done
-done
+# Kernel-truth reconciliation: we do NOT trust an on-disk cache of "what
+# we installed last time" to decide whether to call \`route add\` — that
+# is exactly the bug that left Scott's /24 uninstalled for a day (the
+# cache said it was there; the kernel disagreed; nobody looked). Instead:
+#
+#   DESIRED = CIDRs from current heartbeat response (excluding 0.0.0.0/0
+#             and peers flagged on_same_lan)
+#   PREV    = routes actually pointed at \$WG_REAL right now (netstat)
+#             UNION (belt-and-suspenders) the on-disk record.
+#   to-add    = every CIDR in DESIRED (add_peer_route is idempotent
+#               internally via delete-then-add; cheap to re-assert)
+#   to-delete = PREV \\ DESIRED (plus overlay /32s we own ourselves —
+#               never delete the interface's own address route)
+#
+# The on-disk INSTALLED_ROUTES_FILE is kept only so an operator running
+# a diff against it has a record of "what the last heartbeat intended
+# to own." It is never read as a source of truth.
 
 echo "\$RESPONSE" | jq -c '.probe_peers // []' > "${KEY_DIR}/probe_peers" 2>/dev/null || true
-
-# Shadow direct-probe peers: keep the direct path warm with endpoint +
-# keepalive only, but never let it own any routes until the brain
-# promotes it back to direct carrier ownership.
-echo "\$RESPONSE" | jq -c '.probe_peers[]?' 2>/dev/null | while read -r peer; do
-    PUBKEY=\$(echo "\$peer" | jq -r '.public_key // empty')
-    EP=\$(echo "\$peer" | jq -r '.endpoint // empty')
-    KEEPALIVE=\$(echo "\$peer" | jq -r '.persistent_keepalive // 25')
-    [[ -z "\$PUBKEY" || -z "\$EP" ]] && continue
-    "\$WG_BIN" set "\$WG_REAL" peer "\$PUBKEY" endpoint "\$EP" persistent-keepalive "\$KEEPALIVE"
-done
-
-# Reconcile kernel routes: add only newly-owned CIDRs, remove only stale ones.
-if [[ -s "\${INSTALLED_ROUTES_FILE}.new" ]]; then
-    sort -u "\${INSTALLED_ROUTES_FILE}.new" > "\${INSTALLED_ROUTES_FILE}.sorted" 2>/dev/null || true
-    if [[ -n "\$PREV_ROUTES" ]]; then
-        echo "\$PREV_ROUTES" | while read -r old_cidr; do
-            [[ -z "\$old_cidr" ]] && continue
-            if ! grep -qxF "\$old_cidr" "\${INSTALLED_ROUTES_FILE}.sorted" 2>/dev/null; then
-                del_peer_route "\$old_cidr"
-            fi
-        done
-    fi
-    cat "\${INSTALLED_ROUTES_FILE}.sorted" | while read -r new_cidr; do
-        [[ -z "\$new_cidr" ]] && continue
-        if ! echo "\$PREV_ROUTES" | grep -qxF "\$new_cidr" 2>/dev/null; then
-            add_peer_route "\$new_cidr" "\$WG_REAL"
-        fi
-    done
-    mv -f "\${INSTALLED_ROUTES_FILE}.sorted" "\$INSTALLED_ROUTES_FILE" 2>/dev/null || true
-    printf '%s' "\$WG_REAL" > "\$INSTALLED_ROUTES_IFACE_FILE"
-    rm -f "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
-else
-    # No routes installed this cycle — remove all previously tracked.
-    if [[ -n "\$PREV_ROUTES" ]]; then
-        echo "\$PREV_ROUTES" | while read -r old_cidr; do
-            [[ -z "\$old_cidr" ]] && continue
-            del_peer_route "\$old_cidr"
-        done
-    fi
-    rm -f "\$INSTALLED_ROUTES_FILE" "\$INSTALLED_ROUTES_IFACE_FILE" "\${INSTALLED_ROUTES_FILE}.new" 2>/dev/null || true
-fi
-
-# ── Remove stale WireGuard peers ──────────────────────────────────────────
-# If the brain stopped advertising a peer (e.g., native-LAN host-routed
-# mode), remove it from WireGuard's crypto-key routing table.
-RESPONSE_PUBKEYS=\$(
-    echo "\$RESPONSE" \
-        | jq -r '[(.peers[]?.public_key), (.probe_peers[]?.public_key)] | map(select(. != null and . != "")) | .[]' 2>/dev/null \
-        | sort -u
-)
-WG_PUBKEYS=\$("\$WG_BIN" show "\$WG_REAL" peers 2>/dev/null | sort -u)
-if [[ -n "\$WG_PUBKEYS" ]]; then
-    echo "\$WG_PUBKEYS" | while read -r wg_pk; do
-        [[ -z "\$wg_pk" ]] && continue
-        if ! echo "\$RESPONSE_PUBKEYS" | grep -qxF "\$wg_pk"; then
-            "\$WG_BIN" set "\$WG_REAL" peer "\$wg_pk" remove 2>/dev/null || true
-        fi
-    done
-fi
+reconcile_iface_routes "\$WG_REAL" "${KEY_DIR}" "\$RESPONSE" "\$OVERLAY_IP" primary
 
 # ── Multi-membership heartbeat pass (attached networks wg1+) ─────────────────
 # Attached memberships share the primary's device_secret (same hash on
-# the brain side). Minimal v1 heartbeat per attached iface so the brain
-# keeps them online + tracks per-iface tx/rx. Host-mode state machines
-# above stay primary-only.
+# the brain side). Each attached iface gets its OWN heartbeat (so the
+# brain can track per-iface tx/rx) AND its own route reconcile through
+# reconcile_iface_routes — previously this loop only reported bytes
+# and discarded the response, so attached peers' /32s (and the relay
+# peer serving any cross-network traffic) went uninstalled. Host-mode
+# state machines (route-all, same-LAN, BYO exit) stay primary-only.
 ATTACHED_CAPABILITIES_JSON=\$(current_capabilities_json)
 shopt -s nullglob
 for att_dir in /etc/wireguard/wg* ; do
@@ -752,13 +982,22 @@ for att_dir in /etc/wireguard/wg* ; do
     [[ "\$att_iface" == "${WG_IFACE}" ]] && continue
     att_node_id=\$(cat "\$att_dir/node_id" 2>/dev/null || true)
     att_brain=\$(cat "\$att_dir/brain_url" 2>/dev/null || true)
+    att_overlay=\$(cat "\$att_dir/overlay_ip" 2>/dev/null | tr -d '[:space:]' || true)
     [[ -z "\$att_node_id" || -z "\$att_brain" ]] && continue
     # macOS utun devices aren't enumerable by iface name; rely on
-    # wg show knowing them as the conf alias.
-    att_transfer=\$("\$WG_BIN" show "\$att_iface" transfer 2>/dev/null)
-    [[ -z "\$att_transfer" ]] && continue
+    # wg show knowing them as the conf alias. Also resolve the real
+    # utun name the attached conf was mapped to — reconcile_iface_routes
+    # needs the utunN name for route ops.
+    att_real=\$(cat "/var/run/wireguard/\${att_iface}.name" 2>/dev/null | tr -d '[:space:]')
+    [[ -z "\$att_real" ]] && att_real="\$att_iface"
+    "\$WG_BIN" show "\$att_real" >/dev/null 2>&1 || continue
+    att_transfer=\$("\$WG_BIN" show "\$att_real" transfer 2>/dev/null)
     att_tx=\$(echo "\$att_transfer" | awk '{sum += \$3} END {print sum+0}')
     att_rx=\$(echo "\$att_transfer" | awk '{sum += \$2} END {print sum+0}')
+    # Full v1 heartbeat body (enough for brain to return the peer
+    # list). Host-role-only fields (host_lan_ip, upstream_exit_health)
+    # are omitted — attached memberships are always client-role on
+    # macOS today.
     att_payload=\$(jq -cn \\
         --argjson tx_bytes "\$att_tx" \\
         --argjson rx_bytes "\$att_rx" \\
@@ -768,10 +1007,11 @@ for att_dir in /etc/wireguard/wg* ; do
         '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, connector_version:\$connector_version}')
     ATT_HEADERS=( -H "Content-Type: application/json" )
     [[ -n "\$DEVICE_SECRET" ]] && ATT_HEADERS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
-    curl -sf -X POST "\${ATT_HEADERS[@]}" \\
+    att_response=\$(curl -sf -X POST "\${ATT_HEADERS[@]}" \\
         -d "\$att_payload" \\
-        "\${att_brain%/}/api/v1/nodes/\${att_node_id}/heartbeat" \\
-        >/dev/null 2>&1 || true
+        "\${att_brain%/}/api/v1/nodes/\${att_node_id}/heartbeat" 2>/dev/null) || continue
+    [[ -z "\$att_response" ]] && continue
+    reconcile_iface_routes "\$att_real" "\$att_dir" "\$att_response" "\$att_overlay" attached
 done
 HBSCRIPT
     chmod +x "$HEARTBEAT_SCRIPT"
@@ -922,6 +1162,48 @@ if [[ "$SUBCMD" == "attach" ]]; then
     [[ -n "$ATTACH_BRAIN_URL" ]] || die "Could not determine brain URL. Pass it as the third arg."
     ATTACH_BRAIN_URL="${ATTACH_BRAIN_URL%/}"
 
+    # Overlap guard (C bundle 2026-04-24): refuse to attach if the new
+    # network's routes (passed via ATTACH_ROUTES_CSV) overlap with an
+    # already-attached wgN's installed_routes OR with any non-wg
+    # physical interface's live subnets. The brain can also reject via
+    # preflight_device_attach, but we prefer a local refusal with a
+    # clear message because the user just typed the CIDR.
+    if [[ -n "${ATTACH_ROUTES_CSV:-}" ]]; then
+        collect_existing_tunnel_cidrs() {
+            shopt -s nullglob
+            for d in /etc/wireguard/wg* ; do
+                [[ -d "$d" ]] || continue
+                [[ -f "$d/installed_routes" ]] || continue
+                cat "$d/installed_routes" 2>/dev/null
+            done
+        }
+        collect_physical_iface_subnets() {
+            netstat -rn -f inet 2>/dev/null | awk '
+                $NF ~ /^(utun|lo)/ { next }
+                NR > 3 && $1 ~ /\// {
+                    split($1, parts, "/")
+                    ip = parts[1]; pfx = parts[2]
+                    n = split(ip, oct, ".")
+                    while (n < 4) { oct[++n] = "0" }
+                    print oct[1] "." oct[2] "." oct[3] "." oct[4] "/" pfx
+                }
+            '
+        }
+        existing_tun=$(collect_existing_tunnel_cidrs | sort -u)
+        existing_phys=$(collect_physical_iface_subnets | sort -u)
+        IFS=',' read -r -a _want <<< "$ATTACH_ROUTES_CSV"
+        for _w in "${_want[@]}"; do
+            _w=$(echo "$_w" | xargs)
+            [[ -z "$_w" ]] && continue
+            if echo "$existing_tun" | grep -qxF "$_w"; then
+                die "attach refused: $_w already routed by an attached wgN. Detach it first, or use a non-overlapping subnet."
+            fi
+            if echo "$existing_phys" | grep -qxF "$_w"; then
+                die "attach refused: $_w is already owned by a physical interface. Picking this subnet would hijack LAN traffic — choose a different overlay subnet."
+            fi
+        done
+    fi
+
     next_iface=""
     for n in {1..63}; do
         candidate="wg${n}"
@@ -1045,6 +1327,44 @@ if [[ "$SUBCMD" == "detach" ]]; then
             >/dev/null 2>&1 || warn "Brain-side detach failed; continuing with local teardown."
     fi
 
+    # Explicit route flush BEFORE wg-quick down (C bundle 2026-04-24).
+    # wg-quick down is supposed to clean up routes pointed at the
+    # interface, but any failure (wg-quick not in PATH for launchd,
+    # utun already gone, etc.) would orphan them in the kernel. We
+    # read installed_routes + kernel-scan for utunN routes + attempt
+    # explicit iface-scoped deletes first. Safe no-op if wg-quick
+    # does the right thing too.
+    det_real=$(cat "/var/run/wireguard/${det_iface}.name" 2>/dev/null | tr -d '[:space:]')
+    det_tracked_routes=""
+    [[ -f "${det_dir}/installed_routes" ]] && det_tracked_routes=$(cat "${det_dir}/installed_routes")
+    det_kernel_routes=""
+    if [[ -n "$det_real" ]]; then
+        det_kernel_routes=$(netstat -rn -f inet 2>/dev/null | awk -v iface="$det_real" '
+            $NF == iface {
+                dest = $1
+                split(dest, parts, "/")
+                ip = parts[1]; pfx = parts[2]
+                n = split(ip, oct, ".")
+                while (n < 4) { oct[++n] = "0" }
+                full = oct[1] "." oct[2] "." oct[3] "." oct[4]
+                if (pfx == "") pfx = "32"
+                print full "/" pfx
+            }
+        ' | sort -u)
+    fi
+    {
+        echo "$det_tracked_routes"
+        echo "$det_kernel_routes"
+    } | sort -u | while read -r _cidr; do
+        [[ -z "$_cidr" ]] && continue
+        _pfx="${_cidr#*/}"
+        _ip="${_cidr%/*}"
+        if [[ "$_pfx" == "32" ]]; then
+            route -nq delete -host "$_ip" 2>/dev/null || true
+        else
+            route -nq delete -net "$_cidr" 2>/dev/null || true
+        fi
+    done
     if ifconfig "$det_iface" >/dev/null 2>&1; then
         wg-quick down "/etc/wireguard/${det_iface}.conf" 2>/dev/null || true
     fi
@@ -1360,6 +1680,10 @@ EOF
     # Device protocol v2 secret. Empty when brain is still v1-only.
     DEVICE_SECRET=$(echo "$ENROLL_RESPONSE" | jq -r '.device_secret // empty')
 
+    # Clear any stale revoked marker from a prior node_id's deletion —
+    # re-enrolling is the explicit recovery path out of the revoked
+    # state (see heartbeat 404 handler).
+    rm -f "${KEY_DIR}/revoked" 2>/dev/null || true
     echo "$NODE_ID" > "$NODE_ID_FILE"
     chmod 600 "$NODE_ID_FILE"
     if [[ -n "$DEVICE_ID" ]]; then

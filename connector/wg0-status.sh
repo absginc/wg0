@@ -253,12 +253,27 @@ gather() {
     app_hb_fresh || true
     HB_STATUS=$(hb_status)
     LOG_PATH=$(hb_log_path)
+    HB_MARKER="${KEY_DIR:-/etc/wireguard/wg0}/last_heartbeat"
     LAST_HB="—"
     if [[ "$HB_STATUS" == "app-managed" && "${APP_HB_IS_FRESH:-0}" == "1" && "$APP_HB_LAST_TS" =~ ^[0-9]+$ ]]; then
         local now; now=$(date +%s)
         LAST_HB=$(fmt_ago $((now - APP_HB_LAST_TS)))
+    elif [[ -f "$HB_MARKER" ]]; then
+        # Marker-file mtime is the authoritative source — every
+        # successful heartbeat touches this file (see
+        # connector{.sh,-macos.sh} right after the heartbeat POST
+        # returns). Falling back to log-file mtime gave 25h+ stale
+        # readings because the happy path is silent.
+        local hb_raw; hb_raw=$(stat -f "%Sm" -t "%s" "$HB_MARKER" 2>/dev/null \
+                  || stat -c "%Y" "$HB_MARKER" 2>/dev/null || echo "")
+        if [[ -n "$hb_raw" && "$hb_raw" =~ ^[0-9]+$ ]]; then
+            local now; now=$(date +%s)
+            LAST_HB=$(fmt_ago $((now - hb_raw)))
+        fi
     elif [[ -f "$LOG_PATH" ]]; then
-        # Extract timestamp of last run from log (best-effort)
+        # Fallback for pre-2026.04.24-c connectors that don't touch
+        # the marker file yet. Will be removed once every in-field
+        # connector has upgraded.
         LAST_HB=$(stat -f "%Sm" -t "%s" "$LOG_PATH" 2>/dev/null \
                   || stat -c "%Y" "$LOG_PATH" 2>/dev/null || echo "")
         if [[ -n "$LAST_HB" && "$LAST_HB" =~ ^[0-9]+$ ]]; then

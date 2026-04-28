@@ -28,7 +28,7 @@ Older node-centric endpoints still work and remain important for connector compa
 | `Authorization: Bearer wg0_pat_...` | `bearerAuth` (PAT variant) | long-lived automation / MSP tooling / MCP |
 | `X-Device-Secret: <secret>` | `deviceSecret` | v1 device-authenticated endpoints |
 | `X-Device-Secret` + `Wg0-Protocol-Version: 2` | `strictDeviceAuth` | strict v2 device and installation endpoints |
-| `X-Admin-Key: <key>` | `adminKey` | `/api/v1/admin/*` |
+| Admin JWT or `X-Admin-Key: <key>` | `adminKey` fallback | `/api/v1/admin/*` |
 | `token` field in request body | `enrollmentToken` | `POST /api/v1/enroll/register` only |
 
 ## Public endpoint map
@@ -132,9 +132,10 @@ Multi-network flow, end-to-end:
 4. `DELETE /api/v1/devices/:id/memberships/:node_id` — detach from
    one network; device stays alive + other memberships untouched.
 
-See [MULTI_NETWORK_INSTALLATION_PLAN.md](MULTI_NETWORK_INSTALLATION_PLAN.md)
-for the full design and [CONNECTOR_MULTINETWORK_ROADMAP.md](CONNECTOR_MULTINETWORK_ROADMAP.md)
-for per-connector support status.
+Private operator docs in the source repo track the full multi-network
+installation design and per-connector support matrix. Public API users
+should treat Android as the current managed multi-network reference
+client; other connector families vary by runtime.
 
 ### Enrollment
 - `POST /api/v1/enroll/generate-token`
@@ -157,8 +158,8 @@ preserved (only `*_last_report` anchors reset). If the target was
 deleted between mint and redeem, the brain falls through to the
 existing INSERT path. Used by the portal's per-row "Re-enroll"
 button to avoid consuming another overlay IP on every reinstall.
-See [ROADBLOCKS.md §15 "2026-04-23 — Re-enroll was creating a new
-node"](ROADBLOCKS.md) for the why.
+This keeps portal-driven re-enroll from consuming another overlay IP
+on every reinstall.
 
 ### Nodes — compatibility and owner surface
 - `GET /api/v1/nodes`
@@ -233,7 +234,8 @@ would on an owned one; the difference is entirely at enrollment time.
 - `DELETE /api/v1/shared-network-memberships/:id` — inviter or
   invitee revokes.
 
-Full flow in [SHARED_NETWORK_INVITES.md](SHARED_NETWORK_INVITES.md).
+The shared-network protocol is implemented in the public endpoints
+above; private operator docs track the rollout details.
 
 ### BYO Exit
 - `GET /api/v1/nodes/:id/upstream-exits`
@@ -378,5 +380,5 @@ Error bodies look like:
 
 - [DEVICE_PROTOCOL.md](./DEVICE_PROTOCOL.md)
 - [BYO_EXIT.md](./BYO_EXIT.md)
-- [TESTING_ROADMAP.md](./TESTING_ROADMAP.md)
-- [ROADBLOCKS.md](./ROADBLOCKS.md)
+- [MCP.md](./MCP.md)
+- [openapi.yaml](./openapi.yaml)

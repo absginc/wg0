@@ -33,11 +33,11 @@ The server ships two interchangeable transports:
   (a PAT) in its env. Best for Claude Code, CI, and anyone who'd
   rather configure a JSON file than use a GUI.
 
-Both transports share the same 16 tools, 3 resources, and 4 prompts.
+Both transports share the same 42 tools, 3 resources, and 4 prompts.
 
 The server exposes three kinds of MCP objects:
 
-- **16 tools** — one per meaningful operation (see tool list below)
+- **42 tools** — one per meaningful operation (see tool list below)
 - **3 resources** — the canonical wg0 docs (`llms.txt`, `openapi.yaml`,
   `API.md`) served as browsable MCP resources so the agent can load
   them without a user prompt
@@ -434,7 +434,7 @@ on macOS). Look for lines starting with `wg0-mcp:` — the boot
 banner goes to stderr and should read:
 
 ```
-wg0-mcp: ready. brain=https://connect.wg0.io, tools=16, resources=3, prompts=4
+wg0-mcp: ready. brain=https://connect.wg0.io, tools=42, resources=3, prompts=4
 ```
 
 If you see a different number of tools, the build is out of sync —
