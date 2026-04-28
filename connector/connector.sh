@@ -45,7 +45,7 @@ HEARTBEAT_SCRIPT="/usr/local/bin/wg0-heartbeat"
 # Connector version. Bumped each time this script changes in a way
 # users need to redeploy — heartbeat carries this so the portal can
 # show an "update available" badge on stale nodes.
-CONNECTOR_VERSION="2026.04.27-e"
+CONNECTOR_VERSION="2026.04.28-a"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
@@ -845,7 +845,13 @@ reconcile_iface_routes() {
     if [[ -s "\$desired_file" ]]; then
         sort -u "\$desired_file" > "\${desired_file}.sorted" 2>/dev/null || true
         local kernel_on_iface
-        kernel_on_iface=\$(ip -4 -o route show dev "\$iface" 2>/dev/null | awk '{print \$1}' | sort -u)
+        # Normalize kernel route output to CIDR form. \`ip route\` omits
+        # \`/32\` for host routes (it prints \`10.0.0.5\` not \`10.0.0.5/32\`),
+        # but the desired-routes file always carries the CIDR — so the
+        # naive comparison flagged every /32 we just installed as stale
+        # and the cleanup loop deleted it on the same heartbeat. Append
+        # /32 to any prefix-less line so the comparison matches.
+        kernel_on_iface=\$(ip -4 -o route show dev "\$iface" 2>/dev/null | awk '{print (\$1 ~ /\\//) ? \$1 : \$1 "/32"}' | sort -u)
         {
             echo "\$kernel_on_iface"
             echo "\$prev_disk_routes"
@@ -864,7 +870,13 @@ reconcile_iface_routes() {
         rm -f "\$desired_file" 2>/dev/null || true
     else
         local kernel_on_iface
-        kernel_on_iface=\$(ip -4 -o route show dev "\$iface" 2>/dev/null | awk '{print \$1}' | sort -u)
+        # Normalize kernel route output to CIDR form. \`ip route\` omits
+        # \`/32\` for host routes (it prints \`10.0.0.5\` not \`10.0.0.5/32\`),
+        # but the desired-routes file always carries the CIDR — so the
+        # naive comparison flagged every /32 we just installed as stale
+        # and the cleanup loop deleted it on the same heartbeat. Append
+        # /32 to any prefix-less line so the comparison matches.
+        kernel_on_iface=\$(ip -4 -o route show dev "\$iface" 2>/dev/null | awk '{print (\$1 ~ /\\//) ? \$1 : \$1 "/32"}' | sort -u)
         {
             echo "\$kernel_on_iface"
             echo "\$prev_disk_routes"
