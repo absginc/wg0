@@ -25,7 +25,7 @@ BRAIN_URL="${BRAIN_URL%/}"
 # Connector version. Bumped per release of the container image — the
 # heartbeat carries this so the portal can flag nodes running a stale
 # image.
-CONNECTOR_VERSION="2026.04.27-e"
+CONNECTOR_VERSION="2026.04.29-a"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/wg0.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -566,6 +566,37 @@ setup_native_lan_host_docker() {
 
 setup_native_lan_host_docker
 
+# ── Brain-driven role reconciler ─────────────────────────────────────────────
+# See connector/docker-compat/entrypoint.sh for the rationale; same logic
+# mirrored here so the docker connector also honors brain intent without
+# requiring a redeploy with new env vars.
+reconcile_role_from_brain() {
+    local brain_role="$1"
+    local brain_routes_csv="$2"
+    [[ -z "$brain_role" ]] && return 0
+    [[ "$brain_role" != "host" && "$brain_role" != "client" ]] && return 0
+
+    local prev_role="$ROLE"
+    local prev_routes="${ADVERTISED_ROUTES:-}"
+    if [[ "$brain_role" == "$prev_role" && "$brain_routes_csv" == "$prev_routes" ]]; then
+        return 0
+    fi
+
+    log "Brain role/routes changed: role=${prev_role}→${brain_role} routes='${prev_routes}'→'${brain_routes_csv}'"
+
+    if [[ "$prev_role" == "host" && "$brain_role" != "host" ]]; then
+        cleanup_host_forwarding 2>/dev/null || true
+    fi
+
+    ROLE="$brain_role"
+    ADVERTISED_ROUTES="$brain_routes_csv"
+    export ROLE ADVERTISED_ROUTES
+
+    if [[ "$brain_role" == "host" ]]; then
+        setup_native_lan_host_docker
+    fi
+}
+
 # ── Cleanup host forwarding on shutdown ──────────────────────────────────────
 # Extends the cleanup() trap so a docker stop removes our iptables rules
 # instead of leaving them behind on the host (since --network host shares
@@ -810,6 +841,13 @@ while true; do
         echo "on" > "$COLLECT_TELEMETRY_STATE"
     else
         echo "off" > "$COLLECT_TELEMETRY_STATE"
+    fi
+
+    # Brain-authoritative role reconcile.
+    BRAIN_ROLE=$(echo "$RESPONSE" | jq -r '.role // empty' 2>/dev/null)
+    BRAIN_ROUTES=$(echo "$RESPONSE" | jq -r '(.advertised_routes // []) | join(",")' 2>/dev/null)
+    if [[ -n "$BRAIN_ROLE" ]]; then
+        reconcile_role_from_brain "$BRAIN_ROLE" "$BRAIN_ROUTES"
     fi
 
     # ── Config drift detection ──

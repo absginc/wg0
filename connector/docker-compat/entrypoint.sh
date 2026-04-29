@@ -180,7 +180,7 @@ resolve_iface() {
 
 BRAIN_URL="${BRAIN_URL%/}"
 # Connector version bumped per release — portal flags stale nodes.
-CONNECTOR_VERSION="2026.04.27-e"
+CONNECTOR_VERSION="2026.04.29-a"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/wg0.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -667,6 +667,56 @@ setup_native_lan_host_docker() {
 
 setup_native_lan_host_docker
 
+# ── Brain-driven role reconciler ─────────────────────────────────────────────
+# Brain assigns role + advertised_routes per-node. Without this, the
+# container's startup-time `-e ROLE=…` and `-e ADVERTISED_ROUTES=…` env
+# vars are the only authority, so an operator who promotes a node to
+# host via the portal gets nothing — the connector keeps running in
+# client mode, never reports `upstream_exit_health`, and every
+# VPN-through-host toggle fails brain-side validation forever.
+#
+# Called from the heartbeat loop with the parsed `role` and
+# `advertised_routes` from the heartbeat response. On transition,
+# we update the in-memory variables AND run setup/teardown so live
+# state matches brain intent within ~30s of the portal change.
+reconcile_role_from_brain() {
+    local brain_role="$1"
+    local brain_routes_csv="$2"
+    [[ -z "$brain_role" ]] && return 0
+    [[ "$brain_role" != "host" && "$brain_role" != "client" ]] && return 0
+
+    local prev_role="$ROLE"
+    local prev_routes="${ADVERTISED_ROUTES:-}"
+
+    if [[ "$brain_role" == "$prev_role" && "$brain_routes_csv" == "$prev_routes" ]]; then
+        return 0
+    fi
+
+    log "Brain role/routes changed: role=${prev_role}→${brain_role} routes='${prev_routes}'→'${brain_routes_csv}'"
+
+    # Stash old values for teardown to use.
+    local OLD_ROLE="$prev_role"
+    local OLD_ROUTES="$prev_routes"
+
+    if [[ "$prev_role" == "host" && "$brain_role" != "host" ]]; then
+        # host → client: tear down forwarding before flipping ROLE so
+        # cleanup_host_forwarding's `[[ "$ROLE" == "host" ]] || return` gate
+        # still passes.
+        cleanup_host_forwarding 2>/dev/null || true
+    fi
+
+    ROLE="$brain_role"
+    ADVERTISED_ROUTES="$brain_routes_csv"
+    export ROLE ADVERTISED_ROUTES
+
+    if [[ "$brain_role" == "host" ]]; then
+        # client → host (or refresh on routes change): install/refresh
+        # forwarding rules. Setup is idempotent; ensure_host_rules is a
+        # check-then-add per backend so re-running it is safe.
+        setup_native_lan_host_docker
+    fi
+}
+
 # ── Cleanup host forwarding on shutdown ──────────────────────────────────────
 # Extends the cleanup() trap so a docker stop removes our iptables rules
 # instead of leaving them behind on the host (since --network host shares
@@ -933,6 +983,15 @@ while true; do
         echo "on" > "$COLLECT_TELEMETRY_STATE"
     else
         echo "off" > "$COLLECT_TELEMETRY_STATE"
+    fi
+
+    # Brain-authoritative role reconcile. The heartbeat response carries
+    # the operator's intent from the portal; we converge to it within
+    # one cycle. See reconcile_role_from_brain for the why.
+    BRAIN_ROLE=$(echo "$RESPONSE" | jq -r '.role // empty' 2>/dev/null)
+    BRAIN_ROUTES=$(echo "$RESPONSE" | jq -r '(.advertised_routes // []) | join(",")' 2>/dev/null)
+    if [[ -n "$BRAIN_ROLE" ]]; then
+        reconcile_role_from_brain "$BRAIN_ROLE" "$BRAIN_ROUTES"
     fi
 
     # ── Config drift detection ──
