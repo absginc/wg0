@@ -25,7 +25,7 @@
 # wg-quick always uses the userspace data plane even when the kernel has
 # WG support. This makes behavior deterministic across hosts.
 
-set -euo pipefail
+set -eu
 
 log() { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
 die() { log "FATAL: $*" >&2; exit 1; }
@@ -180,12 +180,12 @@ resolve_iface() {
 
 BRAIN_URL="${BRAIN_URL%/}"
 # Connector version bumped per release — portal flags stale nodes.
-CONNECTOR_VERSION="2026.04.29-a"
-WG_IFACE="wg0"
-WG_CONF="/etc/wireguard/wg0.conf"
+CONNECTOR_VERSION="2026.04.30-e"
+PREFERRED_WG_IFACE="${WG_IFACE:-wg0}"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
 DEVICE_ID_FILE="/etc/wireguard/device_id"
 KEY_DIR="/etc/wireguard/wg0"
+WG_IFACE_FILE="${KEY_DIR}/wg_iface"
 PRIV_KEY_FILE="${KEY_DIR}/private.key"
 PUB_KEY_FILE="${KEY_DIR}/public.key"
 NODE_ID_FILE="${KEY_DIR}/node_id"
@@ -196,9 +196,74 @@ PROBE_PEERS_FILE="${KEY_DIR}/probe_peers"
 COLLECT_TELEMETRY_STATE="${KEY_DIR}/collect_device_telemetry"
 TELEMETRY_CPU_SAMPLE="${KEY_DIR}/telemetry_cpu_sample"
 EGRESS_IFACES_FILE="${KEY_DIR}/egress_ifaces"
+NAT_SOURCE_CIDRS_FILE="${KEY_DIR}/nat_source_cidrs"
+LAN_PUBLICATION_FILE="${KEY_DIR}/lan_publications"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 ROLE="${ROLE:-client}"
 HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
+
+iface_exists() {
+    ip link show "$1" >/dev/null 2>&1 || wg show "$1" >/dev/null 2>&1
+}
+
+iface_has_pubkey() {
+    local iface="$1"
+    [[ -n "${PUB_KEY:-}" ]] || return 1
+    [[ "$(wg show "$iface" public-key 2>/dev/null || true)" == "$PUB_KEY" ]]
+}
+
+select_wg_iface() {
+    local saved="" candidate=""
+    saved=$(cat "$WG_IFACE_FILE" 2>/dev/null || true)
+    for candidate in "$saved" "$PREFERRED_WG_IFACE" wg0 wg1 wg2 wg3 wg4 wg5 wg6 wg7 wg8 wg9 wg10 wg11 wg12 wg13 wg14 wg15; do
+        [[ -n "$candidate" ]] || continue
+        if iface_exists "$candidate"; then
+            if iface_has_pubkey "$candidate"; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+            continue
+        fi
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
+}
+
+configure_wg_paths() {
+    WG_IFACE=$(select_wg_iface) || die "No free WireGuard interface name found."
+    WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
+    WG_LISTEN_PORT_EFFECTIVE=$(choose_wg_listen_port)
+    printf '%s' "$WG_IFACE" > "$WG_IFACE_FILE"
+    chmod 600 "$WG_IFACE_FILE"
+
+    if [[ "$WG_IFACE" != "wg0" && ! -f "$WG_CONF" && -f /etc/wireguard/wg0.conf ]]; then
+        cp /etc/wireguard/wg0.conf "$WG_CONF"
+        chmod 600 "$WG_CONF"
+    fi
+}
+
+port_in_use() {
+    local port="$1"
+    ss -H -lun 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
+}
+
+choose_wg_listen_port() {
+    if [[ -n "${WG_LISTEN_PORT:-}" ]]; then
+        printf '%s\n' "$WG_LISTEN_PORT"
+        return 0
+    fi
+
+    local suffix=0 port
+    if [[ "$WG_IFACE" =~ ^wg([0-9]+)$ ]]; then
+        suffix="${BASH_REMATCH[1]}"
+    fi
+    port=$((51820 + suffix))
+    while port_in_use "$port"; do
+        port=$((port + 1))
+    done
+    printf '%s\n' "$port"
+}
 
 get_or_create_installation_id() {
     local iid=""
@@ -321,6 +386,20 @@ collect_device_telemetry_json() {
 sanitize_wg_conf() {
     [[ -f "$WG_CONF" ]] || return 0
 
+    # In host-network Docker, the host may already have another WireGuard
+    # interface with a route for this overlay subnet. Keep this connector's
+    # interface address host-scoped; explicit peer AllowedIPs install the
+    # routes we actually need.
+    sed -i -E 's|^(Address[[:space:]]*=[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/[0-9]+|\1/32|' "$WG_CONF"
+    if ! grep -qE '^[[:space:]]*Table[[:space:]]*=' "$WG_CONF"; then
+        sed -i '/^\[Interface\]/a Table = off' "$WG_CONF"
+    fi
+    if grep -qE '^[[:space:]]*ListenPort[[:space:]]*=' "$WG_CONF"; then
+        sed -i -E "s|^[[:space:]]*ListenPort[[:space:]]*=.*|ListenPort = ${WG_LISTEN_PORT_EFFECTIVE}|" "$WG_CONF"
+    else
+        sed -i "/^\\[Interface\\]/a ListenPort = ${WG_LISTEN_PORT_EFFECTIVE}" "$WG_CONF"
+    fi
+
     # Replace any sysctl / /proc/sys write with `true` (no-op).
     sed -i \
         -e 's/sysctl -qw [^;]*/true/g' \
@@ -364,6 +443,8 @@ fi
 PRIV_KEY=$(cat "$PRIV_KEY_FILE")
 PUB_KEY=$(cat "$PUB_KEY_FILE")
 INSTALLATION_ID=$(get_or_create_installation_id)
+configure_wg_paths
+log "WireGuard interface selected: ${WG_IFACE}"
 
 # ── Detect public IP ─────────────────────────────────────────────────────────
 PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
@@ -436,7 +517,12 @@ sanitize_wg_conf
 
 # ── Bring up WireGuard ───────────────────────────────────────────────────────
 log "Bringing up WireGuard interface ${WG_IFACE}..."
-wg-quick up "$WG_CONF" || die "Failed to bring up WireGuard."
+if wg show "$WG_IFACE" >/dev/null 2>&1; then
+    iface_has_pubkey "$WG_IFACE" || die "Interface ${WG_IFACE} already exists and is not owned by this connector."
+    log "Interface ${WG_IFACE} already exists for this connector; reusing it."
+else
+    wg-quick up "$WG_CONF" || die "Failed to bring up WireGuard."
+fi
 
 # Resolve the real TUN interface created by wireguard-go (e.g. utun5).
 # All subsequent `ip` and `sysctl` commands must use $REAL_IFACE, not
@@ -488,14 +574,11 @@ setup_native_lan_host_docker() {
     log "Physical LAN interface: ${phys_iface} (route to ${first_route:-default})"
     echo "$phys_iface" > "${KEY_DIR}/phys_iface" 2>/dev/null || true
 
-    # Bridge-mode sanity check — see connector/docker/entrypoint.sh
-    # for the rationale. Default Docker bridge gives 172.16-31.0.0/12
-    # addresses; if that's what phys_iface carries, the host isn't in
-    # --network host mode and LAN-placement forwarding will silently
-    # fail for real LAN devices.
+    # Bridge-mode detection must use interface identity, not RFC1918 address
+    # ranges. 172.16/12 is valid private LAN space and can be the real site LAN.
     local phys_ip_first
-    phys_ip_first=$(ip -4 -o addr show dev "$phys_iface" 2>/dev/null | awk '{print $4}' | head -1 | cut -d/ -f1)
-    if [[ "$phys_ip_first" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]; then
+    phys_ip_first=$(ip -4 -o addr show dev "$phys_iface" 2>/dev/null | awk 'NR==1 {sub(/\/.*/, "", $4); print $4}')
+    if [[ "$phys_iface" =~ ^(docker0|br-|veth|virbr) ]]; then
         log "WARNING: ${phys_iface} has IP ${phys_ip_first}, which looks like a Docker bridge."
         log "         This container is likely NOT running with 'network_mode: host'."
         log "         Wg0 clients will be able to reach each other via the overlay,"
@@ -667,6 +750,190 @@ setup_native_lan_host_docker() {
 
 setup_native_lan_host_docker
 
+route_in_advertised_routes() {
+    local candidate="${1:-}" route
+    [[ -z "$candidate" ]] && return 1
+    IFS=',' read -ra MASQ_ROUTES <<< "${ADVERTISED_ROUTES:-}"
+    for route in "${MASQ_ROUTES[@]}"; do
+        route=$(echo "$route" | xargs)
+        [[ -z "$route" ]] && continue
+        [[ "$candidate" == "$route" ]] && return 0
+    done
+    return 1
+}
+
+peer_source_cidrs_from_response() {
+    local response="${1:-}" cidr
+    [[ -z "$response" ]] && return 0
+    echo "$response" | jq -r '.peers[]?.allowed_ips // empty' 2>/dev/null \
+        | tr ',' '\n' \
+        | while read -r cidr; do
+            cidr=$(echo "$cidr" | xargs)
+            [[ -z "$cidr" || "$cidr" == "0.0.0.0/0" || "$cidr" == "100.64.1.1/32" ]] && continue
+            is_ipv4_cidr "$cidr" || continue
+            route_in_advertised_routes "$cidr" && continue
+            printf '%s\n' "$cidr"
+        done \
+        | sort -u
+}
+
+reconcile_host_source_nat_from_response() {
+    [[ "$ROLE" == "host" ]] || return 0
+    [[ -n "${ADVERTISED_ROUTES:-}" ]] || return 0
+    local response="${1:-}" tmp desired_file prev_file iface cidr old
+    [[ -n "$response" ]] || return 0
+
+    mapfile -t EGRESS_IFACES < "${EGRESS_IFACES_FILE}" 2>/dev/null || EGRESS_IFACES=()
+    [[ "${#EGRESS_IFACES[@]}" -gt 0 ]] || return 0
+
+    tmp=$(mktemp)
+    peer_source_cidrs_from_response "$response" > "$tmp" || true
+
+    desired_file="${NAT_SOURCE_CIDRS_FILE}.new"
+    : > "$desired_file"
+    for iface in "${EGRESS_IFACES[@]}"; do
+        [[ -z "$iface" ]] && continue
+        while read -r cidr; do
+            [[ -z "$cidr" ]] && continue
+            for bin in "${IPTABLES_BINS[@]}"; do
+                command -v "$bin" >/dev/null 2>&1 || continue
+                if ! "$bin" -t nat -C POSTROUTING -s "$cidr" -o "$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null; then
+                    "$bin" -t nat -I POSTROUTING 1 -s "$cidr" -o "$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null || true
+                fi
+            done
+            printf '%s %s\n' "$iface" "$cidr" >> "$desired_file"
+        done < "$tmp"
+    done
+    rm -f "$tmp"
+
+    prev_file="$NAT_SOURCE_CIDRS_FILE"
+    if [[ -f "$prev_file" ]]; then
+        while read -r iface old; do
+            [[ -z "$iface" || -z "$old" ]] && continue
+            grep -qxF "$iface $old" "$desired_file" 2>/dev/null && continue
+            for bin in "${IPTABLES_BINS[@]}"; do
+                command -v "$bin" >/dev/null 2>&1 || continue
+                while "$bin" -t nat -C POSTROUTING -s "$old" -o "$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null; do
+                    "$bin" -t nat -D POSTROUTING -s "$old" -o "$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null || break
+                done
+            done
+        done < "$prev_file"
+    fi
+    mv -f "$desired_file" "$prev_file" 2>/dev/null || true
+}
+
+is_ipv4_addr() {
+    local value="${1:-}" IFS=. octet
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r -a octets <<< "$value"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]+$ && "$octet" -ge 0 && "$octet" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+host_lan_ip_for_iface() {
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || return 0
+    ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
+        | awk 'NR==1 {split($4, a, "/"); print a[1]}'
+}
+
+remove_lan_publication_mapping() {
+    local iface="$1" assigned="$2" lan_ip="$3" host_ip="$4" nat_mode="${5:-snat}" bin
+    [[ -z "$iface" || -z "$assigned" || -z "$lan_ip" ]] && return 0
+    for bin in "${IPTABLES_BINS[@]}"; do
+        command -v "$bin" >/dev/null 2>&1 || continue
+        while "$bin" -t nat -C PREROUTING -i "$iface" -d "${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "$lan_ip" 2>/dev/null; do
+            "$bin" -t nat -D PREROUTING -i "$iface" -d "${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "$lan_ip" 2>/dev/null || break
+        done
+        if [[ "$nat_mode" == "snat" && -n "$host_ip" ]]; then
+            while "$bin" -t nat -C POSTROUTING -o "$iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "$host_ip" 2>/dev/null; do
+                "$bin" -t nat -D POSTROUTING -o "$iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "$host_ip" 2>/dev/null || break
+            done
+        else
+            while "$bin" -t nat -C POSTROUTING -o "$iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null; do
+                "$bin" -t nat -D POSTROUTING -o "$iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null || break
+            done
+        fi
+        while "$bin" -C FORWARD -i "$iface" -o "$iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null; do
+            "$bin" -D FORWARD -i "$iface" -o "$iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || break
+        done
+        while "$bin" -C FORWARD -i "$iface" -o "$iface" -s "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null; do
+            "$bin" -D FORWARD -i "$iface" -o "$iface" -s "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || break
+        done
+    done
+    ip addr del "${assigned}/32" dev "$iface" 2>/dev/null || true
+}
+
+reconcile_lan_publications_from_response() {
+    [[ "$ROLE" == "host" ]] || return 0
+    local response="${1:-}" phys_iface desired_file prev_file iface assigned lan_ip lan_cidr node_id host_ip nat_mode
+    [[ -n "$response" ]] || return 0
+
+    phys_iface=$(cat "${KEY_DIR}/phys_iface" 2>/dev/null || true)
+    if [[ -z "$phys_iface" && -f "$EGRESS_IFACES_FILE" ]]; then
+        phys_iface=$(head -n 1 "$EGRESS_IFACES_FILE" 2>/dev/null || true)
+    fi
+    [[ -n "$phys_iface" ]] || return 0
+
+    host_ip=$(host_lan_ip_for_iface "$phys_iface")
+    desired_file="${LAN_PUBLICATION_FILE}.new"
+    : > "$desired_file"
+
+    echo "$response" | jq -r '
+        .lan_publication.published_clients[]?
+        | select(.publication_mode == "lan_dnat")
+        | select((.assigned_ip // "") != "" and (.lan_ip // "") != "")
+        | [.assigned_ip, .lan_ip, (.lan_cidr // ""), (.node_id // "")]
+        | @tsv
+    ' 2>/dev/null | while IFS=$'\t' read -r assigned lan_ip lan_cidr node_id; do
+        assigned="${assigned%%/*}"
+        [[ -n "$assigned" && -n "$lan_ip" && "$assigned" != "$lan_ip" ]] || continue
+        is_ipv4_addr "$assigned" && is_ipv4_addr "$lan_ip" || continue
+
+        ip addr add "${assigned}/32" dev "$phys_iface" 2>/dev/null || true
+        command -v arping >/dev/null 2>&1 && arping -q -U -c 1 -I "$phys_iface" "$assigned" 2>/dev/null || true
+
+        if [[ -n "$host_ip" ]]; then
+            nat_mode="snat"
+        else
+            nat_mode="masq"
+        fi
+
+        for bin in "${IPTABLES_BINS[@]}"; do
+            command -v "$bin" >/dev/null 2>&1 || continue
+            "$bin" -C FORWARD -i "$phys_iface" -o "$phys_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null \
+                || "$bin" -I FORWARD 1 -i "$phys_iface" -o "$phys_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || true
+            "$bin" -C FORWARD -i "$phys_iface" -o "$phys_iface" -s "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null \
+                || "$bin" -I FORWARD 1 -i "$phys_iface" -o "$phys_iface" -s "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || true
+            "$bin" -t nat -C PREROUTING -i "$phys_iface" -d "${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "$lan_ip" 2>/dev/null \
+                || "$bin" -t nat -I PREROUTING 1 -i "$phys_iface" -d "${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "$lan_ip" 2>/dev/null || true
+            if [[ "$nat_mode" == "snat" ]]; then
+                "$bin" -t nat -C POSTROUTING -o "$phys_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "$host_ip" 2>/dev/null \
+                    || "$bin" -t nat -I POSTROUTING 1 -o "$phys_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "$host_ip" 2>/dev/null || true
+            else
+                "$bin" -t nat -C POSTROUTING -o "$phys_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null \
+                    || "$bin" -t nat -I POSTROUTING 1 -o "$phys_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null || true
+            fi
+        done
+        printf '%s %s %s %s\n' "$phys_iface" "$assigned" "$lan_ip" "${host_ip:-_}:${nat_mode}" >> "$desired_file"
+    done
+
+    prev_file="$LAN_PUBLICATION_FILE"
+    if [[ -f "$prev_file" ]]; then
+        while read -r iface assigned lan_ip host_state; do
+            [[ -z "$iface" || -z "$assigned" || -z "$lan_ip" ]] && continue
+            awk -v i="$iface" -v a="$assigned" -v l="$lan_ip" '$1 == i && $2 == a && $3 == l { found = 1 } END { exit found ? 0 : 1 }' "$desired_file" 2>/dev/null && continue
+            host_ip="${host_state%:*}"
+            [[ "$host_ip" == "_" ]] && host_ip=""
+            nat_mode="${host_state##*:}"
+            remove_lan_publication_mapping "$iface" "$assigned" "$lan_ip" "$host_ip" "$nat_mode"
+        done < "$prev_file"
+    fi
+    mv -f "$desired_file" "$prev_file" 2>/dev/null || true
+}
+
 # ── Brain-driven role reconciler ─────────────────────────────────────────────
 # Brain assigns role + advertised_routes per-node. Without this, the
 # container's startup-time `-e ROLE=…` and `-e ADVERTISED_ROUTES=…` env
@@ -702,6 +969,11 @@ reconcile_role_from_brain() {
         # host → client: tear down forwarding before flipping ROLE so
         # cleanup_host_forwarding's `[[ "$ROLE" == "host" ]] || return` gate
         # still passes.
+        cleanup_host_forwarding 2>/dev/null || true
+    fi
+    if [[ "$prev_role" == "host" && "$brain_role" == "host" && "$brain_routes_csv" != "$prev_routes" ]]; then
+        # host route refresh: remove forwarding/NAT rules tied to the old
+        # advertised routes before setup installs the new route set.
         cleanup_host_forwarding 2>/dev/null || true
     fi
 
@@ -774,6 +1046,28 @@ cleanup_host_forwarding() {
             done
         done
     done
+    if [[ -f "$NAT_SOURCE_CIDRS_FILE" ]]; then
+        while read -r target_iface source_cidr; do
+            [[ -z "$target_iface" || -z "$source_cidr" ]] && continue
+            for bin in "${IPTABLES_BINS[@]}"; do
+                command -v "$bin" >/dev/null 2>&1 || continue
+                while "$bin" -t nat -C POSTROUTING -s "$source_cidr" -o "$target_iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null; do
+                    "$bin" -t nat -D POSTROUTING -s "$source_cidr" -o "$target_iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null || break
+                done
+            done
+        done < "$NAT_SOURCE_CIDRS_FILE"
+        rm -f "$NAT_SOURCE_CIDRS_FILE" 2>/dev/null || true
+    fi
+    if [[ -f "$LAN_PUBLICATION_FILE" ]]; then
+        while read -r pub_iface assigned_ip lan_ip host_state; do
+            [[ -z "$pub_iface" || -z "$assigned_ip" || -z "$lan_ip" ]] && continue
+            pub_host_ip="${host_state%:*}"
+            [[ "$pub_host_ip" == "_" ]] && pub_host_ip=""
+            pub_nat_mode="${host_state##*:}"
+            remove_lan_publication_mapping "$pub_iface" "$assigned_ip" "$lan_ip" "$pub_host_ip" "$pub_nat_mode"
+        done < "$LAN_PUBLICATION_FILE"
+        rm -f "$LAN_PUBLICATION_FILE" 2>/dev/null || true
+    fi
 }
 
 # Restore host sysctl state on shutdown. With --network host the container
@@ -1075,8 +1369,14 @@ while true; do
         # Install system routes + record each CIDR for diff.
         echo "$ALLOWED" | tr ',' '\n' | tr -d ' ' | while read -r cidr; do
             [[ -z "$cidr" || "$cidr" == "0.0.0.0/0" ]] && continue
-            ip route replace "$cidr" dev "$REAL_IFACE" 2>/dev/null || true
-            echo "$cidr" >> "${INSTALLED_ROUTES_FILE}.new"
+            current_dev=$(ip -4 route show "$cidr" 2>/dev/null | awk 'NR==1 {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+            if [[ -n "$current_dev" && "$current_dev" != "$REAL_IFACE" ]]; then
+                log "Skipping route ${cidr}; already owned by ${current_dev}."
+                continue
+            fi
+            if ip route replace "$cidr" dev "$REAL_IFACE" 2>/dev/null; then
+                echo "$cidr" >> "${INSTALLED_ROUTES_FILE}.new"
+            fi
         done
     done
 
@@ -1092,6 +1392,9 @@ while true; do
         [[ -z "$PUBKEY" || -z "$EP" ]] && continue
         wg set ${WG_IFACE} peer "$PUBKEY" endpoint "$EP" persistent-keepalive "$KEEPALIVE"
     done
+
+    reconcile_host_source_nat_from_response "$RESPONSE"
+    reconcile_lan_publications_from_response "$RESPONSE"
 
     # Diff old vs new and remove CIDRs no longer advertised.
     if [[ -f "${INSTALLED_ROUTES_FILE}.new" ]]; then

@@ -40,12 +40,14 @@ CONFIG_VERSION_FILE="${KEY_DIR}/config_version"
 ROLE_FILE="${KEY_DIR}/role"
 ADVERTISED_ROUTES_FILE="${KEY_DIR}/advertised_routes"
 EGRESS_IFACES_FILE="${KEY_DIR}/egress_ifaces"
+NAT_SOURCE_CIDRS_FILE="${KEY_DIR}/nat_source_cidrs"
+LAN_PUBLICATION_FILE="${KEY_DIR}/lan_publications"
 HEARTBEAT_INTERVAL=30
 HEARTBEAT_SCRIPT="/usr/local/bin/wg0-heartbeat"
 # Connector version. Bumped each time this script changes in a way
 # users need to redeploy — heartbeat carries this so the portal can
 # show an "update available" badge on stale nodes.
-CONNECTOR_VERSION="2026.04.28-a"
+CONNECTOR_VERSION="2026.05.01-a"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { echo "[wg0 $(date -u +%H:%M:%SZ)] $*"; }
@@ -233,6 +235,9 @@ SAME_LAN_STATE="${KEY_DIR}/same_lan_state"
 OVERLAY_IP_FILE="${KEY_DIR}/overlay_ip"
 COLLECT_TELEMETRY_STATE="${KEY_DIR}/collect_device_telemetry"
 TELEMETRY_CPU_SAMPLE="${KEY_DIR}/telemetry_cpu_sample"
+EGRESS_IFACES_FILE="${EGRESS_IFACES_FILE}"
+NAT_SOURCE_CIDRS_FILE="${NAT_SOURCE_CIDRS_FILE}"
+LAN_PUBLICATION_FILE="${LAN_PUBLICATION_FILE}"
 # Device protocol v2: read the per-device secret (if this node was
 # enrolled under v2). Empty string if the file doesn't exist — the
 # brain's DeviceAuth extractor will accept the legacy path for pre-v2
@@ -310,7 +315,9 @@ current_capabilities_json() {
         "peer_observations",
         "device_telemetry_v1",
         "desired_state_convergence",
-        "multi_membership_v1"
+        "multi_membership_v1",
+        "lan_presence_client_v1",
+        "lan_presence_linux_v1"
     ]'
 }
 
@@ -355,6 +362,31 @@ detect_host_lan_ip() {
 
     ip -4 -o addr show dev "\$phys_iface" scope global 2>/dev/null \
         | awk '{split(\$4, a, "/"); print a[1]; exit}'
+}
+
+detect_lan_presence_json() {
+    local iface="" gw="" addr="" ip="" prefix="" prefix_json="null" cidr_json="null" transport="ethernet"
+    read -r iface gw < <(get_default)
+    [[ -n "\$iface" && "\$iface" != "${WG_IFACE}" && "\$iface" != "wg0-up" ]] || { echo "[]"; return; }
+
+    addr=\$(ip -4 -o addr show dev "\$iface" scope global 2>/dev/null | awk '{print \$4; exit}')
+    [[ -n "\$addr" ]] || { echo "[]"; return; }
+    ip="\${addr%/*}"
+    prefix="\${addr#*/}"
+    [[ -n "\$ip" && "\$ip" != "\$addr" ]] || { echo "[]"; return; }
+    [[ "\$prefix" =~ ^[0-9]+$ ]] && prefix_json="\$prefix"
+    case "\$iface" in
+        wl*|wifi*|wlan*) transport="wifi" ;;
+    esac
+
+    jq -cn \\
+        --arg ip "\$ip" \\
+        --arg iface "\$iface" \\
+        --arg gateway "\$gw" \\
+        --arg transport "\$transport" \\
+        --argjson prefix_length "\$prefix_json" \\
+        --argjson cidr "\$cidr_json" \\
+        '[{ip:\$ip, prefix_length:\$prefix_length, cidr:\$cidr, gateway:(\$gateway | select(length > 0)), interface_name:\$iface, transport:\$transport}]'
 }
 
 collect_cpu_json() {
@@ -472,6 +504,7 @@ fi
 CAPABILITIES_JSON=\$(current_capabilities_json)
 HOST_LAN_IP=\$(detect_host_lan_ip)
 HOST_LAN_IP_JSON=\$(jq -Rn --arg v "\$HOST_LAN_IP" 'if (\$v | length) > 0 then \$v else null end')
+LAN_PRESENCE_JSON=\$(detect_lan_presence_json)
 INSTALLATION_ID_JSON=\$(jq -Rn --arg v "\$(cat ${INSTALLATION_ID_FILE} 2>/dev/null || echo "")" 'if (\$v | length) > 0 then \$v else null end')
 TELEMETRY_JSON=\$(collect_device_telemetry_json)
 
@@ -485,10 +518,12 @@ HB_BODY=\$(jq -cn \\
     --argjson peers "\$PEERS_JSON" \\
     --argjson route_all_active \$ROUTE_ALL_ACTIVE \\
     --argjson host_lan_ip "\$HOST_LAN_IP_JSON" \\
+    --argjson lan_presence "\$LAN_PRESENCE_JSON" \\
     --argjson upstream_exit_health "\$UPSTREAM_HEALTH_JSON" \\
     --argjson telemetry "\$TELEMETRY_JSON" \\
     '{endpoint:\$endpoint, installation_id:\$installation_id, capabilities:\$capabilities,
       host_lan_ip:\$host_lan_ip, tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, peers:\$peers,
+      lan_presence:\$lan_presence,
       route_all_active:\$route_all_active, upstream_exit_health:\$upstream_exit_health,
       telemetry:\$telemetry, connector_version:\$connector_version}')
 
@@ -580,7 +615,8 @@ if [[ -n "\$NEW_CFG_JSON" ]]; then
     fi
 fi
 
-# Our own overlay /32 for use in same-LAN aliasing below.
+# Our own overlay /32, kept for same-LAN route suppression and cleanup
+# of aliases written by older connector builds.
 OVERLAY_IP=\$(cat "\$OVERLAY_IP_FILE" 2>/dev/null | tr -d '[:space:]')
 
 # ── First pass: extract control-plane signals from peer list ──────────────
@@ -631,37 +667,24 @@ elif [[ "\$ROUTE_ALL_PREV" == on* ]]; then
 fi
 
 # ── Same-LAN state machine ─────────────────────────────────────────────────
-# When the brain flags the host peer as on_same_lan, we skip installing the
-# tunnel routes for that peer (handled below in the per-peer loop) and
-# optionally alias the overlay /32 on the physical default interface so
-# other LAN devices can reach us at our overlay IP. State format:
-#   "on|<iface>|<overlay-ip>" when aliased
-#   "off" otherwise
-#
-# Ordering matters: transition IN must DELETE overlapping tunnel routes
-# BEFORE adding the physical alias. Otherwise there's a race where both
-# \${WG_IFACE} and the physical iface claim the same prefix and local
-# gateway ARP fails. \`ip route del ... dev \${WG_IFACE}\` is iface-scoped
-# so never touches routes owned by anything else.
+# Same-LAN transition. Upgraded clients no longer alias their assigned
+# native /32 onto the physical interface. They report lan_presence and
+# the active host publishes assigned_ip -> physical_ip for LAN peers.
+# Keep the route suppression, and clean up any alias left by older builds.
 SAME_LAN_PREV=\$(cat "\$SAME_LAN_STATE" 2>/dev/null || echo "off")
 
 if [[ "\$ON_SAME_LAN" = "1" && -n "\$OVERLAY_IP" ]]; then
-    read -r PHYS_IFACE _ < <(get_default)
-    # Step 1: tear down every tunnel-iface route overlapping the
-    # suppressed peer CIDRs BEFORE we alias anything. No racing.
     for _c in \$SAME_LAN_PEER_CIDRS; do
         ip route del "\$_c" dev ${WG_IFACE} 2>/dev/null || true
     done
-    if [[ -n "\$PHYS_IFACE" && "\$SAME_LAN_PREV" != on* ]]; then
-        # Step 2: alias overlay IP on the physical interface so LAN
-        # devices can ARP-resolve us at the overlay address.
-        ip addr add "\${OVERLAY_IP}/32" dev "\$PHYS_IFACE" 2>/dev/null || true
-        echo "on|\${PHYS_IFACE}|\${OVERLAY_IP}" > "\$SAME_LAN_STATE"
+    if [[ "\$SAME_LAN_PREV" == on* ]]; then
+        IFS='|' read -r _ PREV_IFACE PREV_OVERLAY <<< "\$SAME_LAN_PREV"
+        if [[ -n "\$PREV_IFACE" && -n "\$PREV_OVERLAY" ]]; then
+            ip addr del "\${PREV_OVERLAY}/32" dev "\$PREV_IFACE" 2>/dev/null || true
+        fi
     fi
+    echo "off" > "\$SAME_LAN_STATE"
 elif [[ "\$SAME_LAN_PREV" == on* ]]; then
-    # Transition OUT: remove the alias first so the physical iface
-    # stops claiming our overlay IP, THEN let the per-peer loop below
-    # reinstall normal tunnel routes on this same cycle.
     IFS='|' read -r _ PREV_IFACE PREV_OVERLAY <<< "\$SAME_LAN_PREV"
     if [[ -n "\$PREV_IFACE" && -n "\$PREV_OVERLAY" ]]; then
         ip addr del "\${PREV_OVERLAY}/32" dev "\$PREV_IFACE" 2>/dev/null || true
@@ -922,8 +945,182 @@ phys_iface_allows_tunnel_cidr_for() {
     return 0
 }
 
+route_in_advertised_routes() {
+    local candidate="\${1:-}" route
+    [[ -z "\$candidate" ]] && return 1
+    IFS=',' read -ra route_list <<< "\$ADVERTISED_ROUTES_CSV"
+    for route in "\${route_list[@]}"; do
+        route=\$(echo "\$route" | xargs)
+        [[ -z "\$route" ]] && continue
+        [[ "\$candidate" == "\$route" ]] && return 0
+    done
+    return 1
+}
+
+peer_source_cidrs_from_response() {
+    local response="\${1:-}" cidr
+    [[ -z "\$response" ]] && return 0
+    echo "\$response" | jq -r '.peers[]?.allowed_ips // empty' 2>/dev/null \\
+        | tr ',' '\\n' \\
+        | while read -r cidr; do
+            cidr=\$(echo "\$cidr" | xargs)
+            [[ -z "\$cidr" || "\$cidr" == "0.0.0.0/0" || "\$cidr" == "100.64.1.1/32" ]] && continue
+            is_ipv4_cidr "\$cidr" || continue
+            route_in_advertised_routes "\$cidr" && continue
+            printf '%s\\n' "\$cidr"
+        done \\
+        | sort -u
+}
+
+reconcile_host_source_nat_from_response() {
+    [[ "\$ROLE" == "host" ]] || return 0
+    [[ -n "\${ADVERTISED_ROUTES_CSV:-}" ]] || return 0
+    local response="\${1:-}" tmp desired_file prev_file iface cidr old
+    [[ -n "\$response" ]] || return 0
+
+    mapfile -t egress_ifaces < "\$EGRESS_IFACES_FILE" 2>/dev/null || egress_ifaces=()
+    [[ "\${#egress_ifaces[@]}" -gt 0 ]] || return 0
+
+    tmp=\$(mktemp)
+    peer_source_cidrs_from_response "\$response" > "\$tmp" || true
+
+    desired_file="\${NAT_SOURCE_CIDRS_FILE}.new"
+    : > "\$desired_file"
+    for iface in "\${egress_ifaces[@]}"; do
+        [[ -z "\$iface" ]] && continue
+        while read -r cidr; do
+            [[ -z "\$cidr" ]] && continue
+            if ! iptables -t nat -C POSTROUTING -s "\$cidr" -o "\$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null; then
+                iptables -t nat -I POSTROUTING 1 -s "\$cidr" -o "\$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null || true
+            fi
+            printf '%s %s\\n' "\$iface" "\$cidr" >> "\$desired_file"
+        done < "\$tmp"
+    done
+    rm -f "\$tmp"
+
+    prev_file="\$NAT_SOURCE_CIDRS_FILE"
+    if [[ -f "\$prev_file" ]]; then
+        while read -r iface old; do
+            [[ -z "\$iface" || -z "\$old" ]] && continue
+            grep -qxF "\$iface \$old" "\$desired_file" 2>/dev/null && continue
+            while iptables -t nat -C POSTROUTING -s "\$old" -o "\$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null; do
+                iptables -t nat -D POSTROUTING -s "\$old" -o "\$iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null || break
+            done
+        done < "\$prev_file"
+    fi
+    mv -f "\$desired_file" "\$prev_file" 2>/dev/null || true
+}
+
+is_ipv4_addr() {
+    local value="\${1:-}" IFS=. octet
+    [[ "\$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    read -r -a octets <<< "\$value"
+    for octet in "\${octets[@]}"; do
+        [[ "\$octet" =~ ^[0-9]+$ && "\$octet" -ge 0 && "\$octet" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+host_lan_ip_for_iface() {
+    local iface="\${1:-}"
+    [[ -n "\$iface" ]] || return 0
+    ip -4 -o addr show dev "\$iface" scope global 2>/dev/null \\
+        | awk 'NR==1 {split(\$4, a, "/"); print a[1]}'
+}
+
+remove_lan_publication_mapping() {
+    local iface="\$1" assigned="\$2" lan_ip="\$3" host_ip="\$4" nat_mode="\${5:-snat}"
+    [[ -z "\$iface" || -z "\$assigned" || -z "\$lan_ip" ]] && return 0
+    while iptables -t nat -C PREROUTING -i "\$iface" -d "\${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "\$lan_ip" 2>/dev/null; do
+        iptables -t nat -D PREROUTING -i "\$iface" -d "\${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "\$lan_ip" 2>/dev/null || break
+    done
+    if [[ "\$nat_mode" == "snat" && -n "\$host_ip" ]]; then
+        while iptables -t nat -C POSTROUTING -o "\$iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "\$host_ip" 2>/dev/null; do
+            iptables -t nat -D POSTROUTING -o "\$iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "\$host_ip" 2>/dev/null || break
+        done
+    else
+        while iptables -t nat -C POSTROUTING -o "\$iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null; do
+            iptables -t nat -D POSTROUTING -o "\$iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null || break
+        done
+    fi
+    while iptables -C FORWARD -i "\$iface" -o "\$iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD -i "\$iface" -o "\$iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || break
+    done
+    while iptables -C FORWARD -i "\$iface" -o "\$iface" -s "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null; do
+        iptables -D FORWARD -i "\$iface" -o "\$iface" -s "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || break
+    done
+    ip addr del "\${assigned}/32" dev "\$iface" 2>/dev/null || true
+}
+
+reconcile_lan_publications_from_response() {
+    [[ "\$ROLE" == "host" ]] || return 0
+    local response="\${1:-}" phys_iface desired_file prev_file iface assigned lan_ip lan_cidr node_id host_ip nat_mode
+    [[ -n "\$response" ]] || return 0
+
+    phys_iface=\$(cat "${KEY_DIR}/phys_iface" 2>/dev/null || true)
+    if [[ -z "\$phys_iface" && -f "\$EGRESS_IFACES_FILE" ]]; then
+        phys_iface=\$(head -n 1 "\$EGRESS_IFACES_FILE" 2>/dev/null || true)
+    fi
+    [[ -n "\$phys_iface" ]] || return 0
+
+    host_ip=\$(host_lan_ip_for_iface "\$phys_iface")
+    desired_file="\${LAN_PUBLICATION_FILE}.new"
+    : > "\$desired_file"
+
+    echo "\$response" | jq -r '
+        .lan_publication.published_clients[]?
+        | select(.publication_mode == "lan_dnat")
+        | select((.assigned_ip // "") != "" and (.lan_ip // "") != "")
+        | [.assigned_ip, .lan_ip, (.lan_cidr // ""), (.node_id // "")]
+        | @tsv
+    ' 2>/dev/null | while IFS=\$'\\t' read -r assigned lan_ip lan_cidr node_id; do
+        assigned="\${assigned%%/*}"
+        [[ -n "\$assigned" && -n "\$lan_ip" && "\$assigned" != "\$lan_ip" ]] || continue
+        is_ipv4_addr "\$assigned" && is_ipv4_addr "\$lan_ip" || continue
+
+        ip addr add "\${assigned}/32" dev "\$phys_iface" 2>/dev/null || true
+        command -v arping >/dev/null 2>&1 && arping -q -U -c 1 -I "\$phys_iface" "\$assigned" 2>/dev/null || true
+
+        if [[ -n "\$host_ip" ]]; then
+            nat_mode="snat"
+        else
+            nat_mode="masq"
+        fi
+
+        iptables -C FORWARD -i "\$phys_iface" -o "\$phys_iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null \\
+            || iptables -I FORWARD 1 -i "\$phys_iface" -o "\$phys_iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -i "\$phys_iface" -o "\$phys_iface" -s "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null \\
+            || iptables -I FORWARD 1 -i "\$phys_iface" -o "\$phys_iface" -s "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || true
+        iptables -t nat -C PREROUTING -i "\$phys_iface" -d "\${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "\$lan_ip" 2>/dev/null \\
+            || iptables -t nat -I PREROUTING 1 -i "\$phys_iface" -d "\${assigned}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "\$lan_ip" 2>/dev/null || true
+        if [[ "\$nat_mode" == "snat" ]]; then
+            iptables -t nat -C POSTROUTING -o "\$phys_iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "\$host_ip" 2>/dev/null \\
+                || iptables -t nat -I POSTROUTING 1 -o "\$phys_iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "\$host_ip" 2>/dev/null || true
+        else
+            iptables -t nat -C POSTROUTING -o "\$phys_iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null \\
+                || iptables -t nat -I POSTROUTING 1 -o "\$phys_iface" -d "\${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null || true
+        fi
+        printf '%s %s %s %s\\n' "\$phys_iface" "\$assigned" "\$lan_ip" "\${host_ip:-_}:\${nat_mode}" >> "\$desired_file"
+    done
+
+    prev_file="\$LAN_PUBLICATION_FILE"
+    if [[ -f "\$prev_file" ]]; then
+        while read -r iface assigned lan_ip host_state; do
+            [[ -z "\$iface" || -z "\$assigned" || -z "\$lan_ip" ]] && continue
+            awk -v i="\$iface" -v a="\$assigned" -v l="\$lan_ip" '\$1 == i && \$2 == a && \$3 == l { found = 1 } END { exit found ? 0 : 1 }' "\$desired_file" 2>/dev/null && continue
+            host_ip="\${host_state%:*}"
+            [[ "\$host_ip" == "_" ]] && host_ip=""
+            nat_mode="\${host_state##*:}"
+            remove_lan_publication_mapping "\$iface" "\$assigned" "\$lan_ip" "\$host_ip" "\$nat_mode"
+        done < "\$prev_file"
+    fi
+    mv -f "\$desired_file" "\$prev_file" 2>/dev/null || true
+}
+
 echo "\$RESPONSE" | jq -c '.probe_peers // []' > "${KEY_DIR}/probe_peers" 2>/dev/null || true
 reconcile_iface_routes "${WG_IFACE}" "${KEY_DIR}" "\$RESPONSE" "\$OVERLAY_IP" primary
+reconcile_host_source_nat_from_response "\$RESPONSE"
+reconcile_lan_publications_from_response "\$RESPONSE"
 
 # ── Multi-membership heartbeat pass (attached networks wg1+) ─────────────────
 # Attached memberships share the primary's device_secret (same hash on
@@ -946,13 +1143,15 @@ for att_dir in /etc/wireguard/wg* ; do
     att_transfer=\$(wg show "\$att_iface" transfer 2>/dev/null)
     att_tx=\$(echo "\$att_transfer" | awk '{sum += \$3} END {print sum+0}')
     att_rx=\$(echo "\$att_transfer" | awk '{sum += \$2} END {print sum+0}')
+    att_lan_presence=\$(detect_lan_presence_json)
     att_payload=\$(jq -cn \\
         --argjson tx_bytes "\$att_tx" \\
         --argjson rx_bytes "\$att_rx" \\
         --argjson installation_id "\$INSTALLATION_ID_JSON" \\
         --argjson capabilities "\$ATTACHED_CAPABILITIES_JSON" \\
+        --argjson lan_presence "\$att_lan_presence" \\
         --arg connector_version "${CONNECTOR_VERSION}" \\
-        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, connector_version:\$connector_version}')
+        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, lan_presence:\$lan_presence, connector_version:\$connector_version}')
     ATT_HEADERS=( -H "Content-Type: application/json" )
     [[ -n "\$DEVICE_SECRET" ]] && ATT_HEADERS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
     att_response=\$(curl -sf -X POST "\${ATT_HEADERS[@]}" \\
@@ -1659,6 +1858,43 @@ if [[ "$SUBCMD" == "unenroll" ]]; then
         while iptables -C FORWARD -i "$WG_IFACE" -o "$WG_IFACE" -j ACCEPT 2>/dev/null; do
             iptables -D FORWARD -i "$WG_IFACE" -o "$WG_IFACE" -j ACCEPT
         done
+        if [[ -f "$NAT_SOURCE_CIDRS_FILE" ]]; then
+            while read -r target_iface source_cidr; do
+                [[ -z "$target_iface" || -z "$source_cidr" ]] && continue
+                while iptables -t nat -C POSTROUTING -s "$source_cidr" -o "$target_iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null; do
+                    iptables -t nat -D POSTROUTING -s "$source_cidr" -o "$target_iface" -m comment --comment "wg0 source NAT" -j MASQUERADE 2>/dev/null || break
+                done
+            done < "$NAT_SOURCE_CIDRS_FILE"
+            rm -f "$NAT_SOURCE_CIDRS_FILE" 2>/dev/null || true
+        fi
+        if [[ -f "$LAN_PUBLICATION_FILE" ]]; then
+            while read -r pub_iface assigned_ip lan_ip host_state; do
+                [[ -z "$pub_iface" || -z "$assigned_ip" || -z "$lan_ip" ]] && continue
+                pub_host_ip="${host_state%:*}"
+                [[ "$pub_host_ip" == "_" ]] && pub_host_ip=""
+                pub_nat_mode="${host_state##*:}"
+                while iptables -t nat -C PREROUTING -i "$pub_iface" -d "${assigned_ip}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "$lan_ip" 2>/dev/null; do
+                    iptables -t nat -D PREROUTING -i "$pub_iface" -d "${assigned_ip}/32" -m comment --comment "wg0 lan publish" -j DNAT --to-destination "$lan_ip" 2>/dev/null || break
+                done
+                if [[ "$pub_nat_mode" == "snat" && -n "$pub_host_ip" ]]; then
+                    while iptables -t nat -C POSTROUTING -o "$pub_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "$pub_host_ip" 2>/dev/null; do
+                        iptables -t nat -D POSTROUTING -o "$pub_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j SNAT --to-source "$pub_host_ip" 2>/dev/null || break
+                    done
+                else
+                    while iptables -t nat -C POSTROUTING -o "$pub_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null; do
+                        iptables -t nat -D POSTROUTING -o "$pub_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j MASQUERADE 2>/dev/null || break
+                    done
+                fi
+                while iptables -C FORWARD -i "$pub_iface" -o "$pub_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null; do
+                    iptables -D FORWARD -i "$pub_iface" -o "$pub_iface" -d "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || break
+                done
+                while iptables -C FORWARD -i "$pub_iface" -o "$pub_iface" -s "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null; do
+                    iptables -D FORWARD -i "$pub_iface" -o "$pub_iface" -s "${lan_ip}/32" -m comment --comment "wg0 lan publish" -j ACCEPT 2>/dev/null || break
+                done
+                ip addr del "${assigned_ip}/32" dev "$pub_iface" 2>/dev/null || true
+            done < "$LAN_PUBLICATION_FILE"
+            rm -f "$LAN_PUBLICATION_FILE" 2>/dev/null || true
+        fi
     fi
 
     # 3c. Restore sysctl state we changed during setup_native_lan_host.

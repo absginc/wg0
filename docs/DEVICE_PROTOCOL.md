@@ -3,7 +3,32 @@
 **Status:** v1 (current behavior) documented + frozen. v2 (formal,
 versioned, device-auth) phased rollout in progress.
 **Owner:** Scott
-**Last revised:** 2026-04-23
+**Last revised:** 2026-05-01
+
+## Update 2026-05-01
+
+- Multi-network managed Android has now been tested on physical
+  hardware: attach, detach, heartbeat convergence, and VPN egress
+  selection work across multiple memberships. Android remains
+  client-only; it must not advertise host capabilities.
+- The control-plane mental model is now explicit: an account owns
+  networks, a managed device/installation can hold multiple network
+  memberships, and each `nodes` row is one membership of that device
+  in one network. Host/client/gateway behavior is a role on the
+  membership, not a separate "host network" object.
+- Overlay access networks use `topology = 'hub_spoke'`. Clients keep
+  overlay IPs, gateway host memberships export one or more LAN CIDRs,
+  and the brain syncs enabled gateway exports into that host node's
+  `advertised_routes`.
+- Native LAN same-LAN reachability is moving away from client-side
+  self-aliasing. Managed clients report physical LAN presence via
+  `lan_presence_client_v1`; active native hosts publish the assigned
+  client `/32` on the LAN and DNAT/SNAT to the client's observed
+  physical address when appropriate.
+- PAT management is JWT-only and now owner/admin-gated. New API keys
+  record the user who minted them so PAT auth inherits that user's
+  current account role instead of always falling back to the first
+  owner membership.
 
 ## Update 2026-04-23
 

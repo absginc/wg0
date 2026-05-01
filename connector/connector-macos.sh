@@ -27,7 +27,7 @@ set -euo pipefail
 # Connector version. Bumped each time this script changes in a way
 # users need to redeploy — heartbeat carries this so the portal can
 # show an "update available" badge.
-CONNECTOR_VERSION="2026.04.28-a"
+CONNECTOR_VERSION="2026.05.01-a"
 WG_IFACE="wg0"
 WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
 INSTALLATION_ID_FILE="/etc/wireguard/installation_id"
@@ -270,7 +270,9 @@ current_capabilities_json() {
         "peer_observations",
         "device_telemetry_v1",
         "desired_state_convergence",
-        "multi_membership_v1"
+        "multi_membership_v1",
+        "lan_presence_client_v1",
+        "lan_presence_macos_shell_v1"
     ]'
 }
 
@@ -308,6 +310,27 @@ detect_host_lan_ip() {
 
     /usr/sbin/ipconfig getifaddr "\$iface" 2>/dev/null \
         || /sbin/ifconfig "\$iface" 2>/dev/null | awk '/inet /{print \$2; exit}'
+}
+
+detect_lan_presence_json() {
+    local iface="" gateway="" ip="" transport="ethernet"
+    iface=\$(/usr/sbin/route -n get default 2>/dev/null | awk '/interface:/{print \$2; exit}')
+    gateway=\$(/usr/sbin/route -n get default 2>/dev/null | awk '/gateway:/{print \$2; exit}')
+    [[ -n "\$iface" ]] || { echo "[]"; return; }
+
+    ip=\$(/usr/sbin/ipconfig getifaddr "\$iface" 2>/dev/null \\
+        || /sbin/ifconfig "\$iface" 2>/dev/null | awk '/inet / && \$2 != "127.0.0.1" {print \$2; exit}')
+    [[ -n "\$ip" ]] || { echo "[]"; return; }
+    case "\$iface" in
+        en0|en1|awdl*|llw*) transport="wifi" ;;
+    esac
+
+    jq -cn \\
+        --arg ip "\$ip" \\
+        --arg iface "\$iface" \\
+        --arg gateway "\$gateway" \\
+        --arg transport "\$transport" \\
+        '[{ip:\$ip, prefix_length:null, cidr:null, gateway:(\$gateway | select(length > 0)), interface_name:\$iface, transport:\$transport}]'
 }
 
 collect_battery_json() {
@@ -405,6 +428,7 @@ fi
 CAPABILITIES_JSON=\$(current_capabilities_json)
 HOST_LAN_IP=\$(detect_host_lan_ip)
 HOST_LAN_IP_JSON=\$(jq -Rn --arg v "\$HOST_LAN_IP" 'if (\$v | length) > 0 then \$v else null end')
+LAN_PRESENCE_JSON=\$(detect_lan_presence_json)
 INSTALLATION_ID_JSON=\$(jq -Rn --arg v "\$(cat ${INSTALLATION_ID_FILE} 2>/dev/null || echo "")" 'if (\$v | length) > 0 then \$v else null end')
 TELEMETRY_JSON=\$(collect_device_telemetry_json)
 
@@ -418,10 +442,12 @@ HB_BODY=\$(jq -cn \\
     --argjson peers "\$PEERS_JSON" \\
     --argjson route_all_active \$ROUTE_ALL_ACTIVE \\
     --argjson host_lan_ip "\$HOST_LAN_IP_JSON" \\
+    --argjson lan_presence "\$LAN_PRESENCE_JSON" \\
     --argjson upstream_exit_health "\$UPSTREAM_HEALTH_JSON" \\
     --argjson telemetry "\$TELEMETRY_JSON" \\
     '{endpoint:\$endpoint, installation_id:\$installation_id, capabilities:\$capabilities,
       host_lan_ip:\$host_lan_ip, tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, peers:\$peers,
+      lan_presence:\$lan_presence,
       route_all_active:\$route_all_active, upstream_exit_health:\$upstream_exit_health,
       telemetry:\$telemetry, connector_version:\$connector_version}')
 
@@ -525,7 +551,8 @@ if [[ -n "\$NEW_CFG_JSON" ]]; then
     fi
 fi
 
-# Our own overlay /32 for use in same-LAN aliasing below.
+# Our own overlay /32, kept for same-LAN route suppression and cleanup
+# of aliases written by older connector builds.
 OVERLAY_IP=\$(cat "\$OVERLAY_IP_FILE" 2>/dev/null | tr -d '[:space:]')
 
 # route_log: low-volume WARN line visible via \`log show\` / launchd stderr
@@ -905,39 +932,24 @@ elif [[ "\$ROUTE_ALL_PREV" == on* ]]; then
 fi
 
 # ── Same-LAN state machine ─────────────────────────────────────────────────
-# State format: "on|<iface>|<overlay-ip>" when aliased, "off" otherwise.
-#
-# Ordering matters here: when transitioning IN (tunnel → on-LAN), we must
-# delete overlapping tunnel routes BEFORE bringing up the physical-iface
-# alias. Otherwise there's a window where both wg0 (/24 carried on the
-# relay peer) and en0 (/24 from DHCP) claim the same prefix, ARP lookups
-# race, and the physical default gateway becomes unreachable. When
-# transitioning OUT (on-LAN → tunnel), we remove the alias first and
-# let the normal reconcile block below reinstall routes on the tunnel.
+# Upgraded clients no longer self-alias their assigned native /32 onto
+# the physical interface. They report lan_presence and the active host
+# publishes assigned_ip -> physical_ip for LAN peers. Keep route
+# suppression for the host peer and remove any alias left by older builds.
 SAME_LAN_PREV=\$(cat "\$SAME_LAN_STATE" 2>/dev/null || echo "off")
 
 if [[ "\$ON_SAME_LAN" = "1" && -n "\$OVERLAY_IP" ]]; then
-    read -r PHYS_IFACE _ < <(get_phys_default)
-    # Step 1: tear down any tunnel routes overlapping the peer CIDRs
-    # we're about to suppress. Do this FIRST, before the alias, so a
-    # concurrent ARP request for the LAN gateway can't race into the
-    # tunnel. Iface-scoped delete only — never touch routes the user
-    # or another tool put there.
     for _c in \$SAME_LAN_PEER_CIDRS; do
         del_peer_route "\$_c"
     done
-    if [[ -n "\$PHYS_IFACE" && "\$SAME_LAN_PREV" != on* ]]; then
-        # Step 2: alias overlay IP on the physical interface so LAN
-        # devices can ARP-resolve us at the overlay address.
-        ifconfig "\$PHYS_IFACE" alias "\$OVERLAY_IP" 255.255.255.255 2>/dev/null || true
-        echo "on|\${PHYS_IFACE}|\${OVERLAY_IP}" > "\$SAME_LAN_STATE"
+    if [[ "\$SAME_LAN_PREV" == on* ]]; then
+        IFS='|' read -r _ PREV_IFACE PREV_OVERLAY <<< "\$SAME_LAN_PREV"
+        if [[ -n "\$PREV_IFACE" && -n "\$PREV_OVERLAY" ]]; then
+            ifconfig "\$PREV_IFACE" -alias "\$PREV_OVERLAY" 2>/dev/null || true
+        fi
     fi
+    echo "off" > "\$SAME_LAN_STATE"
 elif [[ "\$SAME_LAN_PREV" == on* ]]; then
-    # Transition OUT: remove alias first so nothing on the LAN sees us
-    # double-claim our overlay IP. Per-peer loop below will reinstall
-    # normal tunnel routes on this cycle — kernel-truth reconcile
-    # doesn't skip re-adds so the /24 will come back without waiting
-    # for another heartbeat.
     IFS='|' read -r _ PREV_IFACE PREV_OVERLAY <<< "\$SAME_LAN_PREV"
     if [[ -n "\$PREV_IFACE" && -n "\$PREV_OVERLAY" ]]; then
         ifconfig "\$PREV_IFACE" -alias "\$PREV_OVERLAY" 2>/dev/null || true
@@ -1053,6 +1065,7 @@ for att_dir in /etc/wireguard/wg* ; do
     att_transfer=\$("\$WG_BIN" show "\$att_real" transfer 2>/dev/null)
     att_tx=\$(echo "\$att_transfer" | awk '{sum += \$3} END {print sum+0}')
     att_rx=\$(echo "\$att_transfer" | awk '{sum += \$2} END {print sum+0}')
+    att_lan_presence=\$(detect_lan_presence_json)
     # Full v1 heartbeat body (enough for brain to return the peer
     # list). Host-role-only fields (host_lan_ip, upstream_exit_health)
     # are omitted — attached memberships are always client-role on
@@ -1062,8 +1075,9 @@ for att_dir in /etc/wireguard/wg* ; do
         --argjson rx_bytes "\$att_rx" \\
         --argjson installation_id "\$INSTALLATION_ID_JSON" \\
         --argjson capabilities "\$ATTACHED_CAPABILITIES_JSON" \\
+        --argjson lan_presence "\$att_lan_presence" \\
         --arg connector_version "${CONNECTOR_VERSION}" \\
-        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, connector_version:\$connector_version}')
+        '{tx_bytes:\$tx_bytes, rx_bytes:\$rx_bytes, installation_id:\$installation_id, capabilities:\$capabilities, lan_presence:\$lan_presence, connector_version:\$connector_version}')
     ATT_HEADERS=( -H "Content-Type: application/json" )
     [[ -n "\$DEVICE_SECRET" ]] && ATT_HEADERS+=( -H "X-Device-Secret: \$DEVICE_SECRET" )
     att_response=\$(curl -sf -X POST "\${ATT_HEADERS[@]}" \\
